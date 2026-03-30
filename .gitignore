@@ -1,0 +1,20 @@
+# env files
+.env
+backend/.env
+ai-service/.env
+
+# node
+node_modules/
+dist/
+
+# python
+__pycache__/
+*.pyc
+
+# go
+bin/
+*.exe
+*.out
+
+# OS
+.DS_Store
