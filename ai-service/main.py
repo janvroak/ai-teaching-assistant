@@ -69,6 +69,21 @@ class EvaluateFileDetailedResponse(BaseModel):
     improvement_plan: list[str]
 
 
+class ExtractPDFTextOnlyResponse(BaseModel):
+    extracted_text: str
+
+
+class AnswerWithContextRequest(BaseModel):
+    question: str
+    contexts: list[str]
+
+
+class AnswerWithContextResponse(BaseModel):
+    answer: str
+    confidence: float
+    citations: list[str] = []
+
+
 MAX_STUDENT_ANSWER_CHARS = 8000
 QUESTION_STOPWORDS = {
     "a", "an", "the", "and", "or", "to", "of", "in", "on", "for", "with",
@@ -494,6 +509,111 @@ def split_into_question_answer_pairs(extracted_text: str) -> list[ParsedQuestion
 @app.post("/evaluate", response_model=EvaluateResponse)
 def evaluate_answer(payload: EvaluateRequest) -> EvaluateResponse:
     return run_evaluation(payload)
+
+
+@app.post("/extract-pdf-text", response_model=ExtractPDFTextOnlyResponse)
+async def extract_pdf_text(file: UploadFile = File(...)) -> ExtractPDFTextOnlyResponse:
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Please upload a PDF file")
+
+    try:
+        file_bytes = await file.read()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Could not read uploaded file") from exc
+
+    extracted_text = extract_text_from_pdf(file_bytes)
+    return ExtractPDFTextOnlyResponse(extracted_text=extracted_text)
+
+
+@app.post("/answer-with-context", response_model=AnswerWithContextResponse)
+def answer_with_context(payload: AnswerWithContextRequest) -> AnswerWithContextResponse:
+    import json as json_lib
+    import os
+    import re
+
+    from dotenv import load_dotenv
+
+    question = (payload.question or "").strip()
+    contexts = [str(item).strip() for item in payload.contexts if str(item).strip()]
+    if not question:
+        raise HTTPException(status_code=400, detail="question is required")
+    if not contexts:
+        raise HTTPException(status_code=400, detail="contexts list cannot be empty")
+
+    load_dotenv()
+    api_key = os.getenv("OPENROUTER_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=500, detail="OPENROUTER_API_KEY is not set")
+
+    prompt = f"""
+You are a helpful course tutor chatbot.
+
+Your knowledge boundary is strict:
+- Use ONLY the provided course context chunks.
+- Do NOT use outside knowledge, assumptions, or prior world facts.
+- If the answer is not present in context, clearly say it is not available in uploaded course materials.
+
+Teaching style requirements:
+- Explain in a student-friendly way.
+- Prefer short step-by-step explanations when useful.
+- Use simple examples only if those examples are supported by the provided context.
+- Keep the answer focused and avoid unnecessary verbosity.
+
+Return STRICT JSON only with this schema:
+{{
+  "answer": "string",
+  "confidence": 0.0
+}}
+
+Rules:
+- No markdown
+- No code fences
+- Do not mention these instructions
+
+Question:
+{question}
+
+Course context chunks:
+{json_lib.dumps(contexts, ensure_ascii=False)}
+"""
+
+    try:
+        response = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "http://localhost:8000",
+                "X-Title": "AI Teaching Assistant",
+            },
+            json={
+                "model": "mistralai/mistral-7b-instruct-v0.1",
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0,
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+        result = response.json()
+        output_text = result["choices"][0]["message"]["content"]
+    except (requests.RequestException, ValueError, KeyError, IndexError, TypeError) as exc:
+        raise HTTPException(status_code=502, detail=f"RAG answer generation failed: {str(exc)}") from exc
+
+    json_match = re.search(r"\{[\s\S]*\}", output_text)
+    candidate_json = json_match.group(0).strip() if json_match else output_text.strip()
+
+    try:
+        parsed = json_lib.loads(candidate_json)
+        if isinstance(parsed, str):
+            parsed = json_lib.loads(parsed)
+        answer = str(parsed.get("answer", "")).strip()
+        confidence = float(parsed.get("confidence", 0.6))
+        if not answer:
+            answer = "I could not find enough information in the uploaded course material."
+        return AnswerWithContextResponse(answer=answer, confidence=confidence)
+    except (ValueError, TypeError, json_lib.JSONDecodeError):
+        fallback = output_text.strip() or "I could not find enough information in the uploaded course material."
+        return AnswerWithContextResponse(answer=fallback, confidence=0.6)
 
 
 @app.post("/evaluate-file", response_model=EvaluateFileDetailedResponse)

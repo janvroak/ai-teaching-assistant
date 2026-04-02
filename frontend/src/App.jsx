@@ -67,6 +67,14 @@ function App() {
             </ProtectedRoute>
           }
         />
+        <Route
+          path="/courses/:id/assignments/:assignmentId"
+          element={
+            <ProtectedRoute>
+              <CourseDetailPage />
+            </ProtectedRoute>
+          }
+        />
       </Routes>
     </BrowserRouter>
   )

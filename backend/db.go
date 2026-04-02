@@ -71,6 +71,7 @@ END $$;
 		&Assignment{},
 		&Submission{},
 		&Evaluation{},
+		&CourseMaterial{},
 	); err != nil {
 		log.Fatalf("failed to run automigrate: %v", err)
 	}

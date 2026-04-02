@@ -1,0 +1,403 @@
+PAGES=14
+
+--- PAGE 1 ---
+DS357 : Large Language Model
+Indian Institute of Information Technology, Dharwad
+Course Project on
+AI-Powered Personalized Academic Teaching Agent for Course Assistance
+BY
+KV Modak - 23BCS067
+P Aneesh - 23BCS095
+R Shrijan - 23BCS102
+R Janaki Ram - 23BCS141
+TO
+Dr Sunil Saumya
+Assistant Professor
+Department of Data Science and Artifitial Intelligence
+Indian Institute of Information Technology, Dharwad
+
+--- PAGE 2 ---
+Table of Contents
+Chapter 1: Project Proposal................................................................... 1
+1.1 Introduction ............................................................................... 1
+1.2 Problem Statement........................................................................ 1
+1.3 Objectives ................................................................................. 1
+1.4 Proposed Solution ........................................................................ 2
+1.4.1 Core Functionalities ................................................... 2
+1.4.2 AI Agents .............................................................. 5
+1.4.3 Course-Based Progress Tracking and Monitoring .................. 5
+1.5 System Architecture ...................................................................... 7
+1.5.1 Low-Level Design ..................................................... 7
+1.5.2 LLM Workflow ........................................................ 9
+1.5.3 Plagiarism Detection (AI-Focused) .................................. 10
+1.5.4 Confidence Score Formulation ....................................... 10
+1.5.5 Mistake Explanation Framework..................................... 10
+1.5.6 Prompt Engineering Strategy ......................................... 11
+1.5.7 Ranking Mechanism .................................................. 11
+1.5.8 Technology Stack...................................................... 11
+1.6 Implementation Plan (Phases) ........................................................... 12
+
+--- PAGE 3 ---
+Chapter 1: Project Proposal
+1.1 Introduction
+The rapid advancement of Artificial Intelligence, particularly Large Language Models (LLMs),
+has created significant opportunities for transforming educational systems through intelligent
+automation, contextual reasoning, and personalized academic support. Conventional academic
+workflows such as assignment evaluation, student feedback generation, and doubt clarification
+continue to rely heavily on manual intervention, making them time-intensive, inconsistent, and
+difficult to scale across large student populations.
+This project proposes the design and development of an AI-powered academic assistant plat-
+form that functions as a virtual Teaching Assistant (TA). The proposed system integrates Large
+Language Models, Retrieval-Augmented Generation (RAG), semantic similarity analysis, and
+automated evaluation pipelines to provide assignment assessment, context-aware doubt resolu-
+tion, plagiarism analysis, and personalized feedback generation.
+1.2 Problem Statement
+Educational institutions encounter several operational and pedagogical challenges in current
+academic workflows like
+• Manual evaluation of assignments requires significant faculty effort and often leads to
+inconsistency in grading.
+• Existing systems do not provide sufficiently detailed and structured feedback for student
+improvement.
+• Most doubt-resolution platforms lack personalization and domain-specific contextual un-
+derstanding.
+• Classroom teaching context is generally absent during automated question answering.
+• Increasing plagiarism among student submissions remains difficult to detect reliably.
+• Limited availability of intelligent analytics restricts continuous performance monitoring.
+These limitations necessitate the development of a scalable and intelligent academic support
+system capable of automating evaluation while preserving academic integrity and improving
+learning outcomes.
+1.3 Objectives
+The principal objectives of the proposed system are:
+• To develop an automated assignment evaluation framework using Large Language Models.
+• To design a role-based platform supporting both students and faculty members.
+1
+
+--- PAGE 4 ---
+• To implement a context-aware doubt resolution mechanism using Retrieval-Augmented Gen-
+eration.
+• To detect plagiarism through semantic similarity analysis of student submissions.
+• To generate structured feedback and explain conceptual mistakes.
+• To compute confidence scores for AI-generated evaluation results.
+• To provide ranking mechanisms and performance analytics.
+1.4 Proposed Solution
+The proposed system is designed as a modular, multi-agent artificial intelligence platform that
+integrates specialized components to automate academic evaluation while maintaining human
+oversight and enabling personalized learning. The architecture ensures scalability, flexibility,
+and reliability by combining automated intelligence with instructor control.
+1.4.1 Core Functionalities
+Assignment Evaluation
+The system enables automated and structured evaluation of student submissions through the
+following processes:
+• Acceptance of assignment submissions in PDF and image formats, including scanned
+handwritten documents.
+• Extraction of textual content using Optical Character Recognition (OCR) techniques.
+• Segmentation of extracted content into question-wise responses for granular evaluation.
+• Assessment of each response using Large Language Models (LLMs) guided by prede-
+fined answer keys and grading rubrics.
+The system generates the following outputs:
+• Marks allocated for each question.
+• Total score for the assignment.
+• Detailed constructive feedback highlighting strengths and areas for improvement.
+• Corrected or reference answers for comparison.
+2
+
+--- PAGE 5 ---
+Human-in-the-Loop Evaluation (Professor Override System)
+To ensure fairness, accountability, and academic integrity, the system incorporates a human-in-
+the-loop mechanism that allows instructors to review and modify AI-generated evaluations.
+Professor Capabilities
+• View AI-generated marks, feedback, and corrected responses for each student.
+• Edit marks at:
+–Question level
+–Total score level
+• Modify or add feedback manually.
+• Override AI decisions in cases of ambiguity or incorrect grading.
+• Approve or finalize evaluation results before publication.
+Audit and Transparency
+• All modifications are logged and version controlled.
+• The system maintains:
+–Original AI-generated evaluation
+–Instructor-modified evaluation
+• Enables transparency and traceability in grading.
+This ensures that the system functions as an assistive tool rather than a replacement for human
+judgment.
+Role-Based Academic Platform
+The system provides a secure role-based interface supporting distinct functionalities for pro-
+fessors and students.
+Professor Dashboard
+• Create and manage multiple courses.
+• Upload assignments and answer keys.
+• Review and edit AI-generated evaluations.
+• Monitor individual and aggregate student performance.
+• Generate rank lists and evaluation summaries.
+• Access corrected submissions and feedback reports.
+3
+
+--- PAGE 6 ---
+Student Dashboard
+• Enroll in courses using course-specific codes.
+• Submit assignments in digital format.
+• View finalized marks and evaluation results.
+• Access detailed feedback and corrected answers.
+• Track academic performance over time.
+Context-Aware Doubt Resolution
+The system incorporates a context-aware question-answering mechanism to enhance learning
+support.
+• Utilizes classroom summaries and uploaded course materials as contextual knowledge.
+• Employs Retrieval-Augmented Generation (RAG) to retrieve relevant information.
+• Generates responses grounded in course-specific academic content, ensuring accuracy and
+contextual relevance.
+• Restricts responses to course material when necessary to minimize hallucinations.
+Adaptive Learning and Personalization
+The system integrates an adaptive learning mechanism inspired by Reinforcement Learning
+from Human Feedback (RLHF) to personalize interactions based on student capability.
+• Tracks student interaction data, including:
+–Chat history
+–Assignment performance
+–Identified mistake patterns
+• Maintains a dynamic student proficiency profile for each course.
+• Classifies students into proficiency levels:
+–Beginner
+–Intermediate
+–Advanced
+Based on this classification, the system adapts responses as follows:
+• Beginner: Simplified explanations with step-by-step guidance.
+• Intermediate: Moderately detailed explanations with examples.
+• Advanced: Concise and technically detailed responses.
+This ensures personalized academic assistance aligned with individual learning requirements.
+4
+
+--- PAGE 7 ---
+1.4.2 AI Agents
+The platform is structured around a set of specialized AI agents, each responsible for a specific
+function.
+•Teaching Assistant Agent:Provides context-aware responses to student queries using course
+materials and summaries through Retrieval-Augmented Generation (RAG)-based retrieval.
+•Evaluation Agent:Performs automated grading of assignments by analyzing student re-
+sponses against answer keys and predefined grading rubrics.
+•Mistake Analysis Agent:Identifies conceptual errors, missing information, and logical in-
+consistencies, and provides actionable suggestions for improvement.
+•Plagiarism Detection Agent (AI-Focused):Detects academic dishonesty with emphasis on
+AI-assisted and AI-generated submissions through:
+–Semantic similarity analysis across submissions
+–Identification of paraphrased or duplicated content
+–Detection of anomalies in writing style compared to historical submissions
+–Assignment of plagiarism and AI-usage likelihood scores (0–1)
+–Flagging suspicious cases for instructor review
+•Confidence Scoring Agent:Estimates the reliability of AI-generated evaluations by com-
+bining model confidence scores with semantic similarity against reference answers.
+•Analytics Agent:Generates rank lists, performance summaries, and analytical insights to
+support academic monitoring and decision-making.
+.
+1.4.3 Course-Based Progress Tracking and Monitoring
+To ensure meaningful academic evaluation beyond assignment-level grading, the proposed sys-
+tem incorporates a course-aligned progress tracking mechanism that enables continuous moni-
+toring of student learning outcomes.
+Student Progress ComputationEach course is structured into multiple instructional units or
+modules, defined by the instructor together with associated weightages. Student progress is
+computed as a weighted aggregation of performance across these units, thereby reflecting the
+extent of course mastery rather than isolated assignment scores.
+The overall course progress is calculated using:
+P=
+n
+∑
+i=1
+wi ·u i (1.1)
+where:
+5
+
+--- PAGE 8 ---
+•Pdenotes the overall course progress,
+•w i denotes the weight assigned to thei th unit,
+•u i denotes the performance achieved in thei th unit,
+•ndenotes the total number of instructional units in the course.
+Where:
+•Unit Performanceis derived from assignment evaluations and other learning signals.
+•Unit Weightis defined within the course plan by the instructor.
+Multi-Signal Progress EstimationIn scenarios where assignments are unavailable for certain
+units, the system ensures continuity of evaluation through alternative learning signals.
+•Assignment-Based Evaluation (Primary Source)Marks obtained from LLM-evaluated as-
+signments contribute directly to unit performance.
+•Interaction-Based EstimationStudent engagement through the doubt resolution system is
+analyzed. The complexity and depth of submitted queries are used to infer conceptual under-
+standing levels.
+•Content Engagement (Optional Enhancement)Interaction with course materials such as
+notes and summaries contributes to progress estimation.
+A hybrid strategy is adopted:
+• If assignments are available, progress is primarily assignment-driven with minor interaction-
+based adjustment.
+• If assignments are absent, progress is inferred using interaction and engagement signals.
+Professor Progress Monitoring Dashboard
+The system provides a dedicated dashboard enabling faculty to monitor student performance at
+multiple levels.
+Per Student Metrics
+• Overall course progress (%)
+• Unit-wise progress distribution
+• Assignment performance history
+• Learning trend (improving, declining, or consistent)
+• Engagement level in doubt-solving activities
+• Plagiarism and academic integrity indicators
+Class-Level Insights
+6
+
+--- PAGE 9 ---
+• Average course progress
+• Distribution of student performance
+• Identification of weak and strong instructional units across the class
+• List of students falling below expected progress thresholds
+Progress Classification and Transparency
+To maintain interpretability and trust, progress is categorized into:
+• Not Started
+• In Progress
+• Evaluated
+• Mastered
+In cases where progress is inferred due to the absence of assignment-based evaluation, the
+system explicitly indicates:
+“Progress estimated based on interaction and engagement due to absence of assignment-
+based evaluation.”
+1.5 System Architecture
+The proposed system follows a modular layered architecture designed to support scalability,
+multi-course management, and seamless integration of multiple artificial intelligence agents.
+1.5.1 Low-Level Design
+Key Architectural Features
+•Course-Specific Isolation:Each course maintains an independent knowledge base, embed-
+ding space, and contextual repository.
+•Multi-Agent Integration:Each AI component operates as an independent service within
+the AI layer.
+•Human-in-the-Loop Support:Evaluation outputs are routed through the backend layer for
+optional instructor validation and modification.
+•Adaptive Layer:A dedicated module continuously tracks student interactions and dynami-
+cally adjusts system responses.
+7
+
+--- PAGE 10 ---
+Figure 1.1: Proposed Multi-Agent System Architecture
+Figure 1.2: Proposed Multi-Agent System Architecture
+8
+
+--- PAGE 11 ---
+1.5.2 LLM Workflow
+Text Extraction
+• PDF documents are processed using PyMuPDF.
+• Images are processed using OCR systems such as Tesseract or TrOCR.
+Answer Evaluation
+Extracted content is segmented into question-wise responses and provided to the evaluation
+model together with:
+• Question statement
+• Reference answer
+• Student response
+• Evaluation rubric
+Output Generation
+The language model produces structured outputs containing:
+• Marks per question
+• Total score
+• Feedback
+• Mistake analysis
+• Confidence estimation
+These outputs are stored as AI-generated evaluations and may subsequently be reviewed and
+modified by the instructor.
+Adaptive Learning Integration
+• Student interaction data is continuously monitored.
+• Skill level is dynamically updated.
+• Prompts are modified according to proficiency level.
+• Response complexity is adjusted accordingly.
+9
+
+--- PAGE 12 ---
+1.5.3 Plagiarism Detection (AI-Focused)
+Plagiarism detection is performed using semantic embedding techniques with emphasis on
+identifying both conventional copying and AI-assisted content generation.
+Methodology
+• Convert all submissions into embeddings.
+• Compute pairwise cosine similarity across submissions.
+• Compare submissions with historical student data.
+AI-Generated Content DetectionThe system additionally identifies patterns such as:
+• Unusually high coherence compared to prior submissions
+• Generic or overly structured responses
+• Inconsistencies in writing style across submissions
+Interpretation Thresholds
+• 0.9–1.0 : Highly plagiarized or AI-generated
+• 0.7–0.9 : Suspicious similarity
+• Below 0.7 : Acceptable variation
+Flagged submissions are forwarded for instructor review.
+1.5.4 Confidence Score Formulation
+The confidence score represents the reliability of AI-based grading.
+Con f idenceScore=0.6×LLMSel f−Evaluation+0.4×SemanticSimilaritywithRe f erenceAnswer
+(1.2)
+This formulation ensures that grading decisions are supported by both model certainty and
+semantic alignment.
+1.5.5 Mistake Explanation Framework
+The system enhances interpretability and learning outcomes by:
+• Identifying conceptual misunderstandings
+• Detecting missing key concepts
+• Highlighting logical inconsistencies
+• Providing actionable academic suggestions
+All outputs are structured in JSON format to ensure consistency and ease of downstream pro-
+cessing.
+10
+
+--- PAGE 13 ---
+1.5.6 Prompt Engineering Strategy
+Evaluation Prompt Design
+• Explicit specification of evaluator role
+• Strict adherence to rubric-based grading
+• Enforcement of structured JSON output
+• Inclusion of confidence estimation
+Adaptive Prompt Design
+• Dynamically adjusts explanation depth according to student proficiency
+• Simplifies responses for beginners while increasing technical depth for advanced learners
+RAG Prompt Design
+• Restricts responses to retrieved academic context
+• Minimizes hallucinations
+• Ensures relevance to course-specific material
+1.5.7 Ranking Mechanism
+• Students are ranked according to total score in descending order.
+• Equal scores receive identical rank assignment.
+• Rankings are generated independently for each course.
+1.5.8 Technology Stack
+Frontend
+• React.js
+• Tailwind CSS
+Backend
+• Go
+AI Service Layer
+• FastAPI (Python)
+Database
+• PostgreSQL
+11
+
+--- PAGE 14 ---
+Vector Database
+• FAISS / Pinecone (course-specific indexing)
+OCR Systems
+• Tesseract / TrOCR
+Storage
+• AWS S3 / Cloudinary
+1.6 Implementation Plan (Phases)
+The implementation of the proposed system will be carried out in a phased manner to ensure
+modular development, systematic integration, and progressive validation of individual compo-
+nents.
+•Phase 1: System Setup and AuthenticationEstablish the development environment, ini-
+tialize the project architecture, and implement secure authentication and authorization mech-
+anisms for students and professors.
+•Phase 2: Course Management and EnrollmentDevelop course creation, course code gen-
+eration, and student enrollment functionalities within the role-based academic platform.
+•Phase 3: Assignment Submission and OCR PipelineImplement file upload mechanisms
+and integrate OCR pipelines for extracting textual content from PDF and image-based sub-
+missions.
+•Phase 4: LLM-Based Evaluation SystemIntegrate Large Language Models for automated
+answer evaluation using predefined answer keys and grading rubrics.
+•Phase 5: Professor Review and Override SystemDevelop instructor-side interfaces for
+reviewing, modifying, and approving AI-generated evaluation outputs.
+•Phase 6: Retrieval-Augmented Generation (RAG) SystemImplement course-specific re-
+trieval pipelines for context-aware doubt resolution using uploaded academic materials and
+class summaries.
+•Phase 7: Adaptive Learning SystemBuild student profiling mechanisms and response
+adaptation modules based on proficiency levels and interaction history.
+•Phase 8: Plagiarism Detection Engine (AI-Focused)Develop semantic similarity-based
+plagiarism detection along with AI-generated content identification mechanisms.
+•Phase 9: Analytics and Ranking SystemImplement performance analytics, rank genera-
+tion, and course-level academic reporting dashboards.
+•Phase 10: Testing, Optimization, and DeploymentPerform end-to-end testing, optimize
+system performance, and deploy the platform in a scalable production environment.
+12

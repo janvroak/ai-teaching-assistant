@@ -2,14 +2,19 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
 	"encoding/json"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
@@ -44,10 +49,12 @@ type AIEvaluateFileResponse struct {
 }
 
 type AssignmentSubmissionResponse struct {
-	SubmissionID uint   `json:"submission_id"`
-	StudentID    uint   `json:"student_id"`
-	Content      string `json:"content"`
-	Evaluation   gin.H  `json:"evaluation"`
+	SubmissionID   uint   `json:"submission_id"`
+	StudentID      uint   `json:"student_id"`
+	Content        string `json:"content"`
+	SubmissionType string `json:"submission_type"`
+	SubmissionPDF  string `json:"submission_pdf_url,omitempty"`
+	Evaluation     gin.H  `json:"evaluation"`
 }
 
 type MySubmissionResponse struct {
@@ -55,6 +62,8 @@ type MySubmissionResponse struct {
 	AssignmentID    uint   `json:"assignment_id"`
 	AssignmentTitle string `json:"assignment_title"`
 	Content         string `json:"content"`
+	SubmissionType  string `json:"submission_type"`
+	SubmissionPDF   string `json:"submission_pdf_url,omitempty"`
 	Evaluation      gin.H  `json:"evaluation"`
 }
 
@@ -136,6 +145,19 @@ func SubmitHandler(c *gin.Context) {
 		return
 	}
 
+	var existingSubmission Submission
+	if err := DB.Where("student_id = ? AND assignment_id = ?", studentID, req.AssignmentID).First(&existingSubmission).Error; err == nil {
+		c.JSON(http.StatusConflict, gin.H{
+			"error": "You have already submitted this assignment",
+		})
+		return
+	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Failed to verify existing submission",
+		})
+		return
+	}
+
 	submission := Submission{
 		StudentID:    studentID,
 		AssignmentID: req.AssignmentID,
@@ -165,7 +187,7 @@ func SubmitHandler(c *gin.Context) {
 	}
 
 	fastAPIResponse, err := http.Post(
-		"http://localhost:8000/evaluate",
+		fmt.Sprintf("%s/evaluate", aiServiceBaseURL()),
 		"application/json",
 		bytes.NewBuffer(requestBytes),
 	)
@@ -307,6 +329,19 @@ func SubmitFileHandler(c *gin.Context) {
 		return
 	}
 
+	var existingSubmission Submission
+	if err := DB.Where("student_id = ? AND assignment_id = ?", studentID, assignmentID).First(&existingSubmission).Error; err == nil {
+		c.JSON(http.StatusConflict, gin.H{
+			"error": "You have already submitted this assignment",
+		})
+		return
+	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Failed to verify existing submission",
+		})
+		return
+	}
+
 	file, err := fileHeader.Open()
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
@@ -320,6 +355,14 @@ func SubmitFileHandler(c *gin.Context) {
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error": "Could not read uploaded file",
+		})
+		return
+	}
+
+	savedFilePath, err := saveSubmissionPDFFile(fileHeader, fileBytes)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": fmt.Sprintf("Failed to store uploaded submission PDF: %v", err),
 		})
 		return
 	}
@@ -372,7 +415,7 @@ func SubmitFileHandler(c *gin.Context) {
 		return
 	}
 
-	request, err := http.NewRequest(http.MethodPost, "http://localhost:8000/evaluate-file", &multipartBody)
+	request, err := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/evaluate-file", aiServiceBaseURL()), &multipartBody)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"error": "Failed to prepare AI evaluation request",
@@ -423,6 +466,7 @@ func SubmitFileHandler(c *gin.Context) {
 		StudentID:    studentID,
 		AssignmentID: assignmentID,
 		Content:      content,
+		FilePath:     savedFilePath,
 	}
 	if err := DB.Create(&submission).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
@@ -540,7 +584,7 @@ func GetSubmissionsHandler(c *gin.Context) {
 	var submissions []Submission
 	if err := DB.Model(&Submission{}).
 		Where("assignment_id = ?", assignmentID).
-		Distinct("id", "student_id", "content", "created_at").
+		Distinct("id", "student_id", "content", "file_path", "created_at").
 		Order("id ASC").
 		Find(&submissions).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
@@ -609,10 +653,12 @@ func GetSubmissionsHandler(c *gin.Context) {
 		}
 
 		response = append(response, AssignmentSubmissionResponse{
-			SubmissionID: submission.ID,
-			StudentID:    submission.StudentID,
-			Content:      submission.Content,
-			Evaluation:   evaluationData,
+			SubmissionID:   submission.ID,
+			StudentID:      submission.StudentID,
+			Content:        submission.Content,
+			SubmissionType: submissionType(submission),
+			SubmissionPDF:  submissionPDFURL(submission),
+			Evaluation:     evaluationData,
 		})
 	}
 
@@ -732,11 +778,13 @@ func GetSubmissionHandler(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{
 		"submission": gin.H{
-			"id":            submission.ID,
-			"student_id":    submission.StudentID,
-			"assignment_id": submission.AssignmentID,
-			"content":       submission.Content,
-			"created_at":    submission.CreatedAt,
+			"id":               submission.ID,
+			"student_id":       submission.StudentID,
+			"assignment_id":    submission.AssignmentID,
+			"content":          submission.Content,
+			"submission_type":  submissionType(submission),
+			"submission_pdf":   submissionPDFURL(submission),
+			"created_at":       submission.CreatedAt,
 		},
 		"evaluation": gin.H{
 			"marks":      evaluation.Marks,
@@ -845,9 +893,167 @@ func GetMySubmissionsHandler(c *gin.Context) {
 			AssignmentID:    submission.AssignmentID,
 			AssignmentTitle: assignmentTitleByID[submission.AssignmentID],
 			Content:         submission.Content,
+			SubmissionType:  submissionType(submission),
+			SubmissionPDF:   submissionPDFURL(submission),
 			Evaluation:      evaluationData,
 		})
 	}
 
 	c.JSON(http.StatusOK, response)
+}
+
+func GetSubmissionFileHandler(c *gin.Context) {
+	submission, err := getAccessibleSubmission(c)
+	if err != nil {
+		return
+	}
+
+	if strings.TrimSpace(submission.FilePath) == "" {
+		c.JSON(http.StatusNotFound, gin.H{
+			"error": "Submission PDF not found",
+		})
+		return
+	}
+
+	c.File(submission.FilePath)
+}
+
+func getAccessibleSubmission(c *gin.Context) (Submission, error) {
+	if DB == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Database is not initialized",
+		})
+		return Submission{}, errors.New("db not initialized")
+	}
+
+	submissionIDParam := c.Param("id")
+	parsedSubmissionID, err := strconv.ParseUint(submissionIDParam, 10, 64)
+	if err != nil || parsedSubmissionID == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "Invalid submission id",
+		})
+		return Submission{}, errors.New("invalid submission id")
+	}
+	submissionID := uint(parsedSubmissionID)
+
+	roleValue, ok := c.Get("role")
+	role, roleOK := roleValue.(string)
+	if !ok || !roleOK {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"error": "Invalid token context",
+		})
+		return Submission{}, errors.New("invalid role")
+	}
+	role = strings.ToLower(strings.TrimSpace(role))
+
+	userIDValue, ok := c.Get("user_id")
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"error": "Invalid token context",
+		})
+		return Submission{}, errors.New("missing user id")
+	}
+	userID, ok := userIDValue.(uint)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"error": "Invalid user ID in token context",
+		})
+		return Submission{}, errors.New("invalid user id")
+	}
+
+	var submission Submission
+	if err := DB.Where("id = ?", submissionID).First(&submission).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{
+				"error": "Submission not found",
+			})
+		} else {
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"error": "Failed to fetch submission",
+			})
+		}
+		return Submission{}, err
+	}
+
+	switch role {
+	case "student":
+		if submission.StudentID != userID {
+			c.JSON(http.StatusForbidden, gin.H{
+				"error": "You can only access your own submissions",
+			})
+			return Submission{}, errors.New("forbidden")
+		}
+	case "professor":
+		var assignment Assignment
+		if err := DB.Where("id = ?", submission.AssignmentID).First(&assignment).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"error": "Failed to verify submission access",
+			})
+			return Submission{}, err
+		}
+
+		var course Course
+		if err := DB.Where("id = ?", assignment.CourseID).First(&course).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"error": "Failed to verify submission access",
+			})
+			return Submission{}, err
+		}
+
+		if course.ProfessorID != userID {
+			c.JSON(http.StatusForbidden, gin.H{
+				"error": "You can only access submissions from your own courses",
+			})
+			return Submission{}, errors.New("forbidden")
+		}
+	default:
+		c.JSON(http.StatusForbidden, gin.H{
+			"error": "Invalid role",
+		})
+		return Submission{}, errors.New("invalid role")
+	}
+
+	return submission, nil
+}
+
+func submissionType(submission Submission) string {
+	if strings.TrimSpace(submission.FilePath) != "" {
+		return "pdf"
+	}
+	return "text"
+}
+
+func submissionPDFURL(submission Submission) string {
+	if strings.TrimSpace(submission.FilePath) == "" {
+		return ""
+	}
+	return fmt.Sprintf("/submissions/%d/file", submission.ID)
+}
+
+func randomHexToken(n int) (string, error) {
+	buf := make([]byte, n)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(buf), nil
+}
+
+func saveSubmissionPDFFile(fileHeader *multipart.FileHeader, fileBytes []byte) (string, error) {
+	if err := os.MkdirAll("uploads/submissions", 0o755); err != nil {
+		return "", errors.New("could not prepare submissions uploads directory")
+	}
+
+	suffix, err := randomHexToken(6)
+	if err != nil {
+		return "", errors.New("could not generate submission file identifier")
+	}
+
+	filename := fmt.Sprintf("submission-%d-%s%s", time.Now().UnixNano(), suffix, strings.ToLower(filepath.Ext(fileHeader.Filename)))
+	fullPath := filepath.Join("uploads", "submissions", filename)
+
+	if err := os.WriteFile(fullPath, fileBytes, 0o644); err != nil {
+		return "", errors.New("could not write submission PDF file")
+	}
+
+	return filepath.ToSlash(fullPath), nil
 }

@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -30,7 +31,7 @@ func main() {
 		c.Writer.Header().Set("Access-Control-Allow-Origin", "http://localhost:5173")
 		c.Writer.Header().Set("Access-Control-Allow-Credentials", "true")
 		c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-		c.Writer.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS")
+		c.Writer.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 
 		if c.Request.Method == http.MethodOptions {
 			c.AbortWithStatus(http.StatusNoContent)
@@ -43,15 +44,23 @@ func main() {
 	router.POST("/signup", SignupHandler)
 	router.POST("/login", LoginHandler)
 	router.POST("/courses", AuthMiddleware(), CreateCourseHandler)
+	router.DELETE("/courses/:id", AuthMiddleware(), DeleteCourseHandler)
 	router.POST("/courses/join", AuthMiddleware(), JoinCourseHandler)
 	router.GET("/courses", AuthMiddleware(), ListCoursesHandler)
+	router.POST("/courses/:id/materials", AuthMiddleware(), CreateCourseMaterialHandler)
+	router.GET("/courses/:id/materials", AuthMiddleware(), ListCourseMaterialsHandler)
+	router.POST("/courses/:id/doubt", AuthMiddleware(), AskCourseDoubtHandler)
+	router.GET("/materials/:id/file", AuthMiddleware(), GetCourseMaterialFileHandler)
 	router.GET("/courses/:id/assignments", AuthMiddleware(), ListCourseAssignmentsHandler)
 	router.GET("/assignments/:id/submissions", AuthMiddleware(), GetSubmissionsHandler)
+	router.GET("/assignments/:id/question-file", AuthMiddleware(), GetAssignmentQuestionPDFHandler)
+	router.GET("/assignments/:id/answer-key-file", AuthMiddleware(), GetAssignmentAnswerKeyPDFHandler)
 	router.POST("/assignments", AuthMiddleware(), CreateAssignmentHandler)
 	router.POST("/submit", AuthMiddleware(), SubmitHandler)
 	router.POST("/submit-file", AuthMiddleware(), SubmitFileHandler)
 	router.GET("/my-submissions", AuthMiddleware(), GetMySubmissionsHandler)
 	router.GET("/submissions/:id", AuthMiddleware(), GetSubmissionHandler)
+	router.GET("/submissions/:id/file", AuthMiddleware(), GetSubmissionFileHandler)
 	router.PUT("/evaluations/:id", AuthMiddleware(), UpdateEvaluationHandler)
 
 	router.GET("/profile", AuthMiddleware(), func(c *gin.Context) {
@@ -102,7 +111,7 @@ func main() {
 		}
 
 		fastAPIResponse, err := http.Post(
-			"http://localhost:8000/evaluate",
+			fmt.Sprintf("%s/evaluate", aiServiceBaseURL()),
 			"application/json",
 			bytes.NewBuffer(jsonBody),
 		)

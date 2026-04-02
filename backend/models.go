@@ -26,12 +26,14 @@ type Enrollment struct {
 }
 
 type Assignment struct {
-	ID        uint      `gorm:"primaryKey"`
-	CourseID  uint      `gorm:"not null"`
-	Title     string    `gorm:"not null"`
-	Question  string    `gorm:"type:text;not null"`
-	AnswerKey string    `gorm:"type:text;not null"`
-	CreatedAt time.Time `gorm:"not null"`
+	ID                uint      `gorm:"primaryKey"`
+	CourseID          uint      `gorm:"not null"`
+	Title             string    `gorm:"not null"`
+	Question          string    `gorm:"type:text;not null"`
+	QuestionFilePath  string    `gorm:"type:text"`
+	AnswerKey         string    `gorm:"type:text;not null"`
+	AnswerKeyFilePath string    `gorm:"type:text"`
+	CreatedAt         time.Time `gorm:"not null"`
 }
 
 type Submission struct {
@@ -39,6 +41,7 @@ type Submission struct {
 	StudentID    uint      `gorm:"not null"`
 	AssignmentID uint      `gorm:"not null"`
 	Content      string    `gorm:"type:text;not null"`
+	FilePath     string    `gorm:"type:text"`
 	CreatedAt    time.Time `gorm:"not null"`
 }
 
@@ -50,4 +53,13 @@ type Evaluation struct {
 	Confidence   float64   `gorm:"not null"`
 	IsFinal      bool      `gorm:"not null;default:false"`
 	CreatedAt    time.Time `gorm:"not null"`
+}
+
+type CourseMaterial struct {
+	ID        uint      `gorm:"primaryKey"`
+	CourseID  uint      `gorm:"not null;index"`
+	Title     string    `gorm:"not null"`
+	Content   string    `gorm:"type:text;not null"`
+	FilePath  string    `gorm:"type:text"`
+	CreatedAt time.Time `gorm:"not null"`
 }

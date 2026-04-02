@@ -5,6 +5,8 @@ import (
 	"errors"
 	"math/big"
 	"net/http"
+	"os"
+	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -268,6 +270,174 @@ func ListCoursesHandler(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, courses)
+}
+
+func DeleteCourseHandler(c *gin.Context) {
+	if DB == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Database is not initialized",
+		})
+		return
+	}
+
+	roleValue, ok := c.Get("role")
+	role, roleOK := roleValue.(string)
+	if !ok || !roleOK || strings.ToLower(strings.TrimSpace(role)) != "professor" {
+		c.JSON(http.StatusForbidden, gin.H{
+			"error": "Only professors can delete courses",
+		})
+		return
+	}
+
+	userIDValue, ok := c.Get("user_id")
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"error": "Invalid token context",
+		})
+		return
+	}
+
+	professorID, ok := userIDValue.(uint)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"error": "Invalid user ID in token context",
+		})
+		return
+	}
+
+	courseIDParam := c.Param("id")
+	parsedCourseID, err := strconv.ParseUint(courseIDParam, 10, 64)
+	if err != nil || parsedCourseID == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "Invalid course id",
+		})
+		return
+	}
+	courseID := uint(parsedCourseID)
+
+	var course Course
+	if err := DB.Where("id = ? AND professor_id = ?", courseID, professorID).First(&course).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusForbidden, gin.H{
+				"error": "You can only delete your own courses",
+			})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Failed to verify course ownership",
+		})
+		return
+	}
+
+	filePaths := make([]string, 0)
+
+	tx := DB.Begin()
+	if tx.Error != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Failed to start delete transaction",
+		})
+		return
+	}
+
+	rollbackWithError := func(message string) {
+		tx.Rollback()
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": message,
+		})
+	}
+
+	var materials []CourseMaterial
+	if err := tx.Where("course_id = ?", courseID).Find(&materials).Error; err != nil {
+		rollbackWithError("Failed to fetch course materials")
+		return
+	}
+	for _, material := range materials {
+		path := strings.TrimSpace(material.FilePath)
+		if path != "" {
+			filePaths = append(filePaths, path)
+		}
+	}
+
+	var assignments []Assignment
+	if err := tx.Where("course_id = ?", courseID).Find(&assignments).Error; err != nil {
+		rollbackWithError("Failed to fetch assignments")
+		return
+	}
+
+	assignmentIDs := make([]uint, 0, len(assignments))
+	for _, assignment := range assignments {
+		assignmentIDs = append(assignmentIDs, assignment.ID)
+		if path := strings.TrimSpace(assignment.QuestionFilePath); path != "" {
+			filePaths = append(filePaths, path)
+		}
+		if path := strings.TrimSpace(assignment.AnswerKeyFilePath); path != "" {
+			filePaths = append(filePaths, path)
+		}
+	}
+
+	if len(assignmentIDs) > 0 {
+		var submissions []Submission
+		if err := tx.Where("assignment_id IN ?", assignmentIDs).Find(&submissions).Error; err != nil {
+			rollbackWithError("Failed to fetch submissions")
+			return
+		}
+
+		submissionIDs := make([]uint, 0, len(submissions))
+		for _, submission := range submissions {
+			submissionIDs = append(submissionIDs, submission.ID)
+			if path := strings.TrimSpace(submission.FilePath); path != "" {
+				filePaths = append(filePaths, path)
+			}
+		}
+
+		if len(submissionIDs) > 0 {
+			if err := tx.Where("submission_id IN ?", submissionIDs).Delete(&Evaluation{}).Error; err != nil {
+				rollbackWithError("Failed to delete evaluations")
+				return
+			}
+		}
+
+		if err := tx.Where("assignment_id IN ?", assignmentIDs).Delete(&Submission{}).Error; err != nil {
+			rollbackWithError("Failed to delete submissions")
+			return
+		}
+
+		if err := tx.Where("id IN ?", assignmentIDs).Delete(&Assignment{}).Error; err != nil {
+			rollbackWithError("Failed to delete assignments")
+			return
+		}
+	}
+
+	if err := tx.Where("course_id = ?", courseID).Delete(&CourseMaterial{}).Error; err != nil {
+		rollbackWithError("Failed to delete course materials")
+		return
+	}
+
+	if err := tx.Where("course_id = ?", courseID).Delete(&Enrollment{}).Error; err != nil {
+		rollbackWithError("Failed to delete enrollments")
+		return
+	}
+
+	if err := tx.Where("id = ?", courseID).Delete(&Course{}).Error; err != nil {
+		rollbackWithError("Failed to delete course")
+		return
+	}
+
+	if err := tx.Commit().Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Failed to finalize course deletion",
+		})
+		return
+	}
+
+	// Best-effort file cleanup after successful DB transaction.
+	for _, path := range filePaths {
+		_ = os.Remove(path)
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "Course deleted successfully",
+	})
 }
 
 func generateCourseCode(length int) (string, error) {
