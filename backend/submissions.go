@@ -3,8 +3,8 @@ package main
 import (
 	"bytes"
 	"crypto/rand"
-	"encoding/json"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -32,13 +32,31 @@ type AIEvaluateRequest struct {
 }
 
 type AIEvaluateResponse struct {
-	Marks      float64 `json:"marks"`
-	Feedback   string  `json:"feedback"`
-	Confidence float64 `json:"confidence"`
+	Marks           float64  `json:"marks"`
+	Score           float64  `json:"score"`
+	Feedback        string   `json:"feedback"`
+	Confidence      float64  `json:"confidence"`
+	Mistakes        []string `json:"mistakes"`
+	CorrectPoints   []string `json:"correct_points"`
+	WrongPoints     []string `json:"wrong_points"`
+	MissingConcepts []string `json:"missing_concepts"`
+	StrongTopics    []string `json:"strong_topics"`
+	WeakTopics      []string `json:"weak_topics"`
+	Topics          []string `json:"topics"`
 }
 
 type AIEvaluateFileResult struct {
-	Confidence float64 `json:"confidence"`
+	Marks           float64  `json:"marks"`
+	Score           float64  `json:"score"`
+	Feedback        string   `json:"feedback"`
+	Confidence      float64  `json:"confidence"`
+	Mistakes        []string `json:"mistakes"`
+	CorrectPoints   []string `json:"correct_points"`
+	WrongPoints     []string `json:"wrong_points"`
+	MissingConcepts []string `json:"missing_concepts"`
+	StrongTopics    []string `json:"strong_topics"`
+	WeakTopics      []string `json:"weak_topics"`
+	Topics          []string `json:"topics"`
 }
 
 type AIEvaluateFileResponse struct {
@@ -46,6 +64,67 @@ type AIEvaluateFileResponse struct {
 	Results         []AIEvaluateFileResult `json:"results"`
 	TotalMarks      float64                `json:"total_marks"`
 	OverallFeedback string                 `json:"overall_feedback"`
+	CommonMistakes  []string               `json:"common_mistakes"`
+}
+
+func normalizedTopics(topics []string) []string {
+	return normalizeStringList(topics, 20)
+}
+
+func collectTopicsFromFileResults(results []AIEvaluateFileResult) []string {
+	topics := make([]string, 0)
+	for _, result := range results {
+		topics = append(topics, result.Topics...)
+	}
+	return normalizeStringList(topics, 20)
+}
+
+func collectMistakesFromFileResults(results []AIEvaluateFileResult) []string {
+	mistakes := make([]string, 0)
+	for _, result := range results {
+		mistakes = append(mistakes, result.Mistakes...)
+	}
+	return normalizeStringList(mistakes, 40)
+}
+
+func collectCorrectPointsFromFileResults(results []AIEvaluateFileResult) []string {
+	correctPoints := make([]string, 0)
+	for _, result := range results {
+		correctPoints = append(correctPoints, result.CorrectPoints...)
+	}
+	return normalizeStringList(correctPoints, 40)
+}
+
+func collectWrongPointsFromFileResults(results []AIEvaluateFileResult) []string {
+	wrongPoints := make([]string, 0)
+	for _, result := range results {
+		wrongPoints = append(wrongPoints, result.WrongPoints...)
+	}
+	return normalizeStringList(wrongPoints, 40)
+}
+
+func collectMissingConceptsFromFileResults(results []AIEvaluateFileResult) []string {
+	missingConcepts := make([]string, 0)
+	for _, result := range results {
+		missingConcepts = append(missingConcepts, result.MissingConcepts...)
+	}
+	return normalizeStringList(missingConcepts, 40)
+}
+
+func collectStrongTopicsFromFileResults(results []AIEvaluateFileResult) []string {
+	topics := make([]string, 0)
+	for _, result := range results {
+		topics = append(topics, result.StrongTopics...)
+	}
+	return normalizeStringList(topics, 20)
+}
+
+func collectWeakTopicsFromFileResults(results []AIEvaluateFileResult) []string {
+	topics := make([]string, 0)
+	for _, result := range results {
+		topics = append(topics, result.WeakTopics...)
+	}
+	return normalizeStringList(topics, 20)
 }
 
 type AssignmentSubmissionResponse struct {
@@ -158,18 +237,6 @@ func SubmitHandler(c *gin.Context) {
 		return
 	}
 
-	submission := Submission{
-		StudentID:    studentID,
-		AssignmentID: req.AssignmentID,
-		Content:      req.Content,
-	}
-	if err := DB.Create(&submission).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": "Failed to create submission",
-		})
-		return
-	}
-
 	evalReq := AIEvaluateRequest{
 		Question:        strings.TrimSpace(assignment.Question),
 		StudentAnswer:   req.Content,
@@ -222,24 +289,67 @@ func SubmitHandler(c *gin.Context) {
 		return
 	}
 
-	evaluation := Evaluation{
-		SubmissionID: submission.ID,
-		Marks:        evalResp.Marks,
-		Feedback:     evalResp.Feedback,
-		Confidence:   evalResp.Confidence,
-		IsFinal:      false,
-	}
-	if err := DB.Create(&evaluation).Error; err != nil {
+	evaluation := Evaluation{}
+	if err := DB.Transaction(func(tx *gorm.DB) error {
+		submission := Submission{
+			StudentID:    studentID,
+			AssignmentID: req.AssignmentID,
+			Content:      req.Content,
+		}
+		if err := tx.Create(&submission).Error; err != nil {
+			return err
+		}
+
+		evaluation = Evaluation{
+			SubmissionID:    submission.ID,
+			Marks:           evalResp.Marks,
+			Feedback:        evalResp.Feedback,
+			Confidence:      evalResp.Confidence,
+			Mistakes:        normalizeStringList(evalResp.Mistakes, 40),
+			CorrectPoints:   normalizeStringList(evalResp.CorrectPoints, 40),
+			WrongPoints:     normalizeStringList(evalResp.WrongPoints, 40),
+			MissingConcepts: normalizeStringList(evalResp.MissingConcepts, 40),
+			StrongTopics:    normalizeStringList(evalResp.StrongTopics, 20),
+			WeakTopics:      normalizeStringList(evalResp.WeakTopics, 20),
+			Topics: normalizedTopics(func() []string {
+				if len(evalResp.Topics) > 0 {
+					return evalResp.Topics
+				}
+				return append(append([]string{}, evalResp.StrongTopics...), evalResp.WeakTopics...)
+			}()),
+			IsFinal: false,
+		}
+		if err := tx.Create(&evaluation).Error; err != nil {
+			return err
+		}
+
+		return updateAdaptiveProfileOnEvaluation(
+			tx,
+			studentID,
+			assignment.CourseID,
+			evaluation.Marks,
+			evalReq.Question,
+			evaluation.Mistakes,
+		)
+	}); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": "Failed to store evaluation",
+			"error": "Failed to save submission evaluation",
 		})
 		return
 	}
 
 	c.JSON(http.StatusCreated, gin.H{
-		"marks":      evaluation.Marks,
-		"feedback":   evaluation.Feedback,
-		"confidence": evaluation.Confidence,
+		"marks":            evaluation.Marks,
+		"score":            evaluation.Marks,
+		"feedback":         evaluation.Feedback,
+		"confidence":       evaluation.Confidence,
+		"correct_points":   evaluation.CorrectPoints,
+		"wrong_points":     evaluation.WrongPoints,
+		"missing_concepts": evaluation.MissingConcepts,
+		"strong_topics":    evaluation.StrongTopics,
+		"weak_topics":      evaluation.WeakTopics,
+		"mistakes":         evaluation.Mistakes,
+		"topics":           evaluation.Topics,
 	})
 }
 
@@ -459,18 +569,8 @@ func SubmitFileHandler(c *gin.Context) {
 
 	content := strings.TrimSpace(evalResp.ExtractedText)
 	if content == "" {
-		content = "Submitted via PDF file upload"
-	}
-
-	submission := Submission{
-		StudentID:    studentID,
-		AssignmentID: assignmentID,
-		Content:      content,
-		FilePath:     savedFilePath,
-	}
-	if err := DB.Create(&submission).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": "Failed to create submission",
+		c.JSON(http.StatusBadGateway, gin.H{
+			"error": "AI evaluation service returned empty extracted text",
 		})
 		return
 	}
@@ -489,23 +589,72 @@ func SubmitFileHandler(c *gin.Context) {
 		feedback = "Evaluation completed from uploaded PDF."
 	}
 
-	evaluation := Evaluation{
-		SubmissionID: submission.ID,
-		Marks:        evalResp.TotalMarks,
-		Feedback:     feedback,
-		Confidence:   confidence,
-		IsFinal:      false,
-	}
-	if err := DB.Create(&evaluation).Error; err != nil {
+	evaluation := Evaluation{}
+	if err := DB.Transaction(func(tx *gorm.DB) error {
+		submission := Submission{
+			StudentID:    studentID,
+			AssignmentID: assignmentID,
+			Content:      content,
+			FilePath:     savedFilePath,
+		}
+		if err := tx.Create(&submission).Error; err != nil {
+			return err
+		}
+
+		evaluation = Evaluation{
+			SubmissionID:    submission.ID,
+			Marks:           evalResp.TotalMarks,
+			Feedback:        feedback,
+			Confidence:      confidence,
+			Mistakes:        collectMistakesFromFileResults(evalResp.Results),
+			CorrectPoints:   collectCorrectPointsFromFileResults(evalResp.Results),
+			WrongPoints:     collectWrongPointsFromFileResults(evalResp.Results),
+			MissingConcepts: collectMissingConceptsFromFileResults(evalResp.Results),
+			StrongTopics:    collectStrongTopicsFromFileResults(evalResp.Results),
+			WeakTopics:      collectWeakTopicsFromFileResults(evalResp.Results),
+			Topics: normalizedTopics(func() []string {
+				collected := collectTopicsFromFileResults(evalResp.Results)
+				if len(collected) > 0 {
+					return collected
+				}
+				return append(
+					append([]string{}, collectStrongTopicsFromFileResults(evalResp.Results)...),
+					collectWeakTopicsFromFileResults(evalResp.Results)...,
+				)
+			}()),
+			IsFinal: false,
+		}
+		if err := tx.Create(&evaluation).Error; err != nil {
+			return err
+		}
+
+		return updateAdaptiveProfileOnEvaluation(
+			tx,
+			studentID,
+			assignment.CourseID,
+			evaluation.Marks,
+			questionText,
+			evaluation.Mistakes,
+		)
+	}); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": "Failed to store evaluation",
+			"error": "Failed to save submission evaluation",
 		})
 		return
 	}
 
 	c.JSON(http.StatusCreated, gin.H{
-		"marks":    evaluation.Marks,
-		"feedback": evaluation.Feedback,
+		"marks":            evaluation.Marks,
+		"score":            evaluation.Marks,
+		"feedback":         evaluation.Feedback,
+		"confidence":       evaluation.Confidence,
+		"correct_points":   evaluation.CorrectPoints,
+		"wrong_points":     evaluation.WrongPoints,
+		"missing_concepts": evaluation.MissingConcepts,
+		"strong_topics":    evaluation.StrongTopics,
+		"weak_topics":      evaluation.WeakTopics,
+		"mistakes":         evaluation.Mistakes,
+		"topics":           evaluation.Topics,
 	})
 }
 
@@ -640,16 +789,32 @@ func GetSubmissionsHandler(c *gin.Context) {
 	response := make([]AssignmentSubmissionResponse, 0, len(submissions))
 	for _, submission := range submissions {
 		evaluationData := gin.H{
-			"id":         nil,
-			"marks":      nil,
-			"feedback":   nil,
-			"confidence": nil,
+			"id":               nil,
+			"marks":            nil,
+			"score":            nil,
+			"feedback":         nil,
+			"confidence":       nil,
+			"correct_points":   []string{},
+			"wrong_points":     []string{},
+			"missing_concepts": []string{},
+			"strong_topics":    []string{},
+			"weak_topics":      []string{},
+			"mistakes":         []string{},
+			"topics":           []string{},
 		}
 		if evaluation, exists := evaluationBySubmissionID[submission.ID]; exists {
 			evaluationData["id"] = evaluation.ID
 			evaluationData["marks"] = evaluation.Marks
+			evaluationData["score"] = evaluation.Marks
 			evaluationData["feedback"] = evaluation.Feedback
 			evaluationData["confidence"] = evaluation.Confidence
+			evaluationData["correct_points"] = evaluation.CorrectPoints
+			evaluationData["wrong_points"] = evaluation.WrongPoints
+			evaluationData["missing_concepts"] = evaluation.MissingConcepts
+			evaluationData["strong_topics"] = evaluation.StrongTopics
+			evaluationData["weak_topics"] = evaluation.WeakTopics
+			evaluationData["mistakes"] = evaluation.Mistakes
+			evaluationData["topics"] = evaluation.Topics
 		}
 
 		response = append(response, AssignmentSubmissionResponse{
@@ -778,18 +943,26 @@ func GetSubmissionHandler(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{
 		"submission": gin.H{
-			"id":               submission.ID,
-			"student_id":       submission.StudentID,
-			"assignment_id":    submission.AssignmentID,
-			"content":          submission.Content,
-			"submission_type":  submissionType(submission),
-			"submission_pdf":   submissionPDFURL(submission),
-			"created_at":       submission.CreatedAt,
+			"id":              submission.ID,
+			"student_id":      submission.StudentID,
+			"assignment_id":   submission.AssignmentID,
+			"content":         submission.Content,
+			"submission_type": submissionType(submission),
+			"submission_pdf":  submissionPDFURL(submission),
+			"created_at":      submission.CreatedAt,
 		},
 		"evaluation": gin.H{
-			"marks":      evaluation.Marks,
-			"feedback":   evaluation.Feedback,
-			"confidence": evaluation.Confidence,
+			"marks":            evaluation.Marks,
+			"score":            evaluation.Marks,
+			"feedback":         evaluation.Feedback,
+			"confidence":       evaluation.Confidence,
+			"correct_points":   evaluation.CorrectPoints,
+			"wrong_points":     evaluation.WrongPoints,
+			"missing_concepts": evaluation.MissingConcepts,
+			"strong_topics":    evaluation.StrongTopics,
+			"weak_topics":      evaluation.WeakTopics,
+			"mistakes":         evaluation.Mistakes,
+			"topics":           evaluation.Topics,
 		},
 	})
 }
@@ -877,15 +1050,31 @@ func GetMySubmissionsHandler(c *gin.Context) {
 	response := make([]MySubmissionResponse, 0, len(submissions))
 	for _, submission := range submissions {
 		evaluationData := gin.H{
-			"marks":      nil,
-			"feedback":   nil,
-			"confidence": nil,
+			"marks":            nil,
+			"score":            nil,
+			"feedback":         nil,
+			"confidence":       nil,
+			"correct_points":   []string{},
+			"wrong_points":     []string{},
+			"missing_concepts": []string{},
+			"strong_topics":    []string{},
+			"weak_topics":      []string{},
+			"mistakes":         []string{},
+			"topics":           []string{},
 		}
 
 		if evaluation, exists := evaluationBySubmissionID[submission.ID]; exists {
 			evaluationData["marks"] = evaluation.Marks
+			evaluationData["score"] = evaluation.Marks
 			evaluationData["feedback"] = evaluation.Feedback
 			evaluationData["confidence"] = evaluation.Confidence
+			evaluationData["correct_points"] = evaluation.CorrectPoints
+			evaluationData["wrong_points"] = evaluation.WrongPoints
+			evaluationData["missing_concepts"] = evaluation.MissingConcepts
+			evaluationData["strong_topics"] = evaluation.StrongTopics
+			evaluationData["weak_topics"] = evaluation.WeakTopics
+			evaluationData["mistakes"] = evaluation.Mistakes
+			evaluationData["topics"] = evaluation.Topics
 		}
 
 		response = append(response, MySubmissionResponse{

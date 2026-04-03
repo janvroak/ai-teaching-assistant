@@ -67,6 +67,17 @@ The platform supports role-based academic workflows:
   - `GET /assignments/:id/submissions`
   - `PUT /evaluations/:id` to override marks/feedback
 
+- **RAG Doubt Resolution (Phase 6)**
+  - `POST /courses/:id/materials` to upload course material
+  - `GET /courses/:id/materials` to list course materials
+  - `POST /courses/:id/doubt` for context-grounded answers with citations
+
+- **Adaptive Learning (Phase 7 - Initial)**
+  - Student profiling per course from evaluation history
+  - Proficiency levels: `beginner`, `intermediate`, `advanced`
+  - Adaptive doubt responses based on proficiency + interaction history
+  - `GET /courses/:id/student-profile` for current student profile
+
 ## Project Structure
 
 ```text
@@ -152,6 +163,11 @@ JWT_SECRET=your_secret_key_here
 - `GET /assignments/:id/submissions`
 - `PUT /evaluations/:id`
 - `GET /submissions/:id`
+- `POST /courses/:id/materials`
+- `GET /courses/:id/materials`
+- `POST /courses/:id/doubt`
+- `GET /courses/:id/student-profile`
+- `GET /materials/:id/file`
 
 ## AI Service API Snapshot
 

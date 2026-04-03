@@ -6,3 +6,39 @@ body {
   @apply bg-gray-100 text-gray-900;
   font-family: system-ui, sans-serif;
 }
+
+input,
+textarea {
+  color: white;
+  opacity: 1;
+  -webkit-text-fill-color: white;
+}
+
+input::placeholder,
+textarea::placeholder {
+  color: #9ca3af;
+  opacity: 1;
+}
+
+.card {
+  background: rgba(255, 255, 255, 0.05);
+  backdrop-filter: blur(12px);
+  border-radius: 16px;
+  padding: 20px;
+  margin-top: 20px;
+}
+
+.tag {
+  padding: 6px 12px;
+  border-radius: 999px;
+  margin: 5px;
+  display: inline-block;
+}
+
+.tag.red {
+  background: rgba(255, 0, 0, 0.2);
+}
+
+.tag.green {
+  background: rgba(0, 255, 0, 0.2);
+}

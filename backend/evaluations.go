@@ -77,7 +77,35 @@ func UpdateEvaluationHandler(c *gin.Context) {
 	evaluation.Feedback = req.Feedback
 	evaluation.IsFinal = true
 
-	if err := DB.Save(&evaluation).Error; err != nil {
+	type submissionContext struct {
+		StudentID uint
+		CourseID  uint
+	}
+	var ctx submissionContext
+	if err := DB.Table("submissions AS s").
+		Select("s.student_id AS student_id, a.course_id AS course_id").
+		Joins("JOIN assignments AS a ON a.id = s.assignment_id").
+		Where("s.id = ?", evaluation.SubmissionID).
+		Scan(&ctx).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Failed to load submission context",
+		})
+		return
+	}
+	if ctx.StudentID == 0 || ctx.CourseID == 0 {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Invalid submission context for evaluation",
+		})
+		return
+	}
+
+	if err := DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Save(&evaluation).Error; err != nil {
+			return err
+		}
+		_, err := recomputeAdaptiveProfile(tx, ctx.StudentID, ctx.CourseID)
+		return err
+	}); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"error": "Failed to update evaluation",
 		})

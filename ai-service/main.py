@@ -1,10 +1,12 @@
 import json
+import math
+import threading
 import re
 
 import fitz  # PyMuPDF
 import requests
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from dotenv import load_dotenv
 import os
@@ -13,6 +15,10 @@ load_dotenv()
 API_KEY = os.getenv("OPENROUTER_API_KEY")
 
 app = FastAPI()
+
+_EMBEDDING_MODEL_LOCK = threading.Lock()
+_EMBEDDING_MODEL = None
+_EMBEDDING_MODEL_LOAD_FAILED = False
 
 
 class EvaluateRequest(BaseModel):
@@ -23,10 +29,17 @@ class EvaluateRequest(BaseModel):
 
 class EvaluateResponse(BaseModel):
     marks: float
+    score: float
     feedback: str
+    correct_points: list[str]
+    wrong_points: list[str]
+    missing_concepts: list[str]
+    strong_topics: list[str]
+    weak_topics: list[str]
     mistakes: list[str]
     suggestions: list[str]
     confidence: float
+    topics: list[str]
 
 
 class EvaluateFileResponse(EvaluateResponse):
@@ -45,10 +58,17 @@ class EvaluateMultipleRequest(BaseModel):
 class QuestionWiseResult(BaseModel):
     question: str
     marks: float
+    score: float
     feedback: str
+    correct_points: list[str]
+    wrong_points: list[str]
+    missing_concepts: list[str]
+    strong_topics: list[str]
+    weak_topics: list[str]
     mistakes: list[str]
     suggestions: list[str]
     confidence: float
+    topics: list[str]
 
 
 class EvaluateMultipleResponse(BaseModel):
@@ -76,12 +96,36 @@ class ExtractPDFTextOnlyResponse(BaseModel):
 class AnswerWithContextRequest(BaseModel):
     question: str
     contexts: list[str]
+    proficiency_level: str | None = None
+    weak_topics: list[str] = Field(default_factory=list)
+    recent_mistakes: list[str] = Field(default_factory=list)
 
 
 class AnswerWithContextResponse(BaseModel):
     answer: str
     confidence: float
     citations: list[str] = []
+
+
+def adaptation_instructions(proficiency_level: str) -> str:
+    level = (proficiency_level or "").strip().lower()
+    if level == "advanced":
+        return (
+            "- Keep the explanation concise and technically deep.\n"
+            "- Use precise domain terminology when relevant.\n"
+            "- Skip unnecessary basic background."
+        )
+    if level == "beginner":
+        return (
+            "- Explain step-by-step.\n"
+            "- Use simple language and avoid jargon.\n"
+            "- Add one easy example grounded in the provided context."
+        )
+    return (
+        "- Use moderate detail with clear structure.\n"
+        "- Include one practical example from context.\n"
+        "- Use some technical terms, but keep it accessible."
+    )
 
 
 MAX_STUDENT_ANSWER_CHARS = 8000
@@ -115,19 +159,290 @@ def should_short_circuit_evaluation(question: str, student_answer: str) -> bool:
     return not has_overlap
 
 
+def clamp01(value: float) -> float:
+    return max(0.0, min(1.0, value))
+
+
+def cosine_similarity(a: list[float], b: list[float]) -> float:
+    if not a or not b or len(a) != len(b):
+        return 0.0
+
+    dot = 0.0
+    norm_a = 0.0
+    norm_b = 0.0
+    for x, y in zip(a, b):
+        dot += x * y
+        norm_a += x * x
+        norm_b += y * y
+
+    if norm_a <= 0 or norm_b <= 0:
+        return 0.0
+    return dot / (math.sqrt(norm_a) * math.sqrt(norm_b))
+
+
+def normalize_similarity(raw_cosine: float) -> float:
+    # cosine in [-1, 1] -> normalized similarity in [0, 1]
+    return clamp01((raw_cosine + 1.0) / 2.0)
+
+
+def token_jaccard_similarity(a_text: str, b_text: str) -> float:
+    a_tokens = set(re.findall(r"[a-zA-Z0-9]+", (a_text or "").lower()))
+    b_tokens = set(re.findall(r"[a-zA-Z0-9]+", (b_text or "").lower()))
+    if not a_tokens or not b_tokens:
+        return 0.0
+    intersection = len(a_tokens.intersection(b_tokens))
+    union = len(a_tokens.union(b_tokens))
+    if union == 0:
+        return 0.0
+    return clamp01(intersection / union)
+
+
+def embed_with_sentence_transformers(texts: list[str]) -> list[list[float]] | None:
+    global _EMBEDDING_MODEL
+    global _EMBEDDING_MODEL_LOAD_FAILED
+
+    if _EMBEDDING_MODEL_LOAD_FAILED:
+        return None
+
+    with _EMBEDDING_MODEL_LOCK:
+        if _EMBEDDING_MODEL is None:
+            try:
+                from sentence_transformers import SentenceTransformer
+                model_name = os.getenv("SENTENCE_TRANSFORMER_MODEL", "all-MiniLM-L6-v2")
+                _EMBEDDING_MODEL = SentenceTransformer(model_name)
+            except Exception as exc:
+                print("SentenceTransformer unavailable:", str(exc))
+                _EMBEDDING_MODEL_LOAD_FAILED = True
+                return None
+
+    try:
+        vectors = _EMBEDDING_MODEL.encode(texts, convert_to_numpy=True, normalize_embeddings=True)
+        return [vector.astype(float).tolist() for vector in vectors]
+    except Exception as exc:
+        print("SentenceTransformer embedding failed:", str(exc))
+        return None
+
+
+def embed_with_openai(texts: list[str]) -> list[list[float]] | None:
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        return None
+
+    model = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small").strip() or "text-embedding-3-small"
+    try:
+        response = requests.post(
+            "https://api.openai.com/v1/embeddings",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model,
+                "input": texts,
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        data = payload.get("data", [])
+        if not isinstance(data, list) or len(data) != len(texts):
+            return None
+        embeddings: list[list[float]] = []
+        for item in data:
+            vector = item.get("embedding", [])
+            if not isinstance(vector, list) or not vector:
+                return None
+            embeddings.append([float(v) for v in vector])
+        return embeddings
+    except Exception as exc:
+        print("OpenAI embedding fallback failed:", str(exc))
+        return None
+
+
+def semantic_similarity(student_answer: str, reference_answer: str) -> float:
+    student = (student_answer or "").strip()
+    reference = (reference_answer or "").strip()
+    if not student or not reference:
+        return 0.0
+
+    vectors = embed_with_sentence_transformers([student, reference])
+    if vectors and len(vectors) == 2:
+        raw = cosine_similarity(vectors[0], vectors[1])
+        return normalize_similarity(raw)
+
+    vectors = embed_with_openai([student, reference])
+    if vectors and len(vectors) == 2:
+        raw = cosine_similarity(vectors[0], vectors[1])
+        return normalize_similarity(raw)
+
+    # Final fallback if embedding backends are unavailable.
+    return token_jaccard_similarity(student, reference)
+
+
+def apply_similarity_penalty(
+    marks: float,
+    feedback: str,
+    mistakes: list[str],
+    suggestions: list[str],
+    similarity: float,
+    allow_not_relevant_feedback: bool = True,
+) -> tuple[float, str, list[str], list[str]]:
+    if similarity >= 0.3:
+        return marks, feedback, mistakes, suggestions
+
+    penalized_marks = max(0.0, min(marks, marks * 0.6))
+    penalty_line = "Answer not relevant."
+
+    updated_feedback = (feedback or "").strip()
+    if allow_not_relevant_feedback:
+        if penalty_line.lower() not in updated_feedback.lower():
+            if updated_feedback:
+                updated_feedback = f"{updated_feedback} {penalty_line}"
+            else:
+                updated_feedback = penalty_line
+
+    updated_mistakes = list(mistakes or [])
+    if allow_not_relevant_feedback and all("not relevant" not in str(item).lower() for item in updated_mistakes):
+        updated_mistakes.append("Answer not relevant to the expected reference concepts.")
+
+    updated_suggestions = list(suggestions or [])
+    if all("reference answer" not in str(item).lower() for item in updated_suggestions):
+        updated_suggestions.append("Align your response with the reference answer's key concepts.")
+
+    return penalized_marks, updated_feedback, updated_mistakes, updated_suggestions
+
+
+def clean_text(value: str) -> str:
+    text = str(value or "")
+    text = text.replace("\r", " ").replace("\n", " ")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def normalize_concept_list(items: list[str], limit: int = 20) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in items or []:
+        cleaned = clean_text(item)
+        if not cleaned:
+            continue
+        lowered = cleaned.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        result.append(cleaned)
+        if limit > 0 and len(result) >= limit:
+            break
+    return result
+
+
+def derive_topics_from_points(
+    correct_points: list[str],
+    wrong_points: list[str],
+    missing_concepts: list[str],
+) -> tuple[list[str], list[str], list[str]]:
+    # Strict rule: topics are derived only from concept-level evaluation points.
+    strong_topics = normalize_concept_list(correct_points, 12)
+    weak_topics = normalize_concept_list((wrong_points or []) + (missing_concepts or []), 12)
+    all_topics = normalize_concept_list(strong_topics + weak_topics, 20)
+    return strong_topics, weak_topics, all_topics
+
+
+def clamp_score(value: float) -> float:
+    return max(0.0, min(10.0, float(value)))
+
+
+def enforce_structured_score(
+    raw_score: float,
+    correct_points: list[str],
+    wrong_points: list[str],
+    missing_concepts: list[str],
+    student_answer: str,
+    reference_answer: str,
+) -> float:
+    score = clamp_score(raw_score)
+    total_concepts = len(correct_points) + len(wrong_points) + len(missing_concepts)
+    if total_concepts <= 0:
+        if not (student_answer or "").strip():
+            return 0.0
+        return score
+
+    coverage = len(correct_points) / float(total_concepts)
+    deterministic_score = (coverage * 10.0) - (len(wrong_points) * 1.2) - (len(missing_concepts) * 0.8)
+    deterministic_score = clamp_score(deterministic_score)
+    score = clamp_score((0.7 * score) + (0.3 * deterministic_score))
+
+    if len(correct_points) == 0 and (len(wrong_points) > 0 or len(missing_concepts) > 0):
+        score = min(score, 2.9)
+    elif coverage >= 0.7 and len(correct_points) >= 2:
+        score = max(score, 7.0)
+    elif 0 < coverage < 0.7:
+        score = min(max(score, 4.0), 7.0)
+
+    if token_jaccard_similarity(student_answer, reference_answer) < 0.08 and len(correct_points) == 0:
+        score = min(score, 2.0)
+
+    return clamp_score(score)
+
+
 def run_evaluation(payload: EvaluateRequest) -> EvaluateResponse:
-    import os
-    import re
     import json as json_lib
     from dotenv import load_dotenv
 
-    if should_short_circuit_evaluation(payload.question, payload.student_answer):
+    question = clean_text(payload.question)
+    student_answer = clean_text(payload.student_answer)
+    reference_answer = clean_text(payload.reference_answer)
+    print("QUESTION:", question)
+    print("REFERENCE:", reference_answer[:300])
+    print("STUDENT:", student_answer[:300])
+    similarity = semantic_similarity(student_answer, reference_answer)
+
+    if len(reference_answer) < 10:
+        strong_topics, weak_topics, topics = derive_topics_from_points([], [], [])
         return EvaluateResponse(
+            marks=5,
+            score=5,
+            feedback="Reference answer missing, partial evaluation only",
+            correct_points=[],
+            wrong_points=[],
+            missing_concepts=[],
+            strong_topics=strong_topics,
+            weak_topics=weak_topics,
+            mistakes=[],
+            suggestions=["Add a detailed reference answer for full grading accuracy."],
+            confidence=0.5,
+            topics=topics,
+        )
+
+    if should_short_circuit_evaluation(question, student_answer):
+        llm_confidence = 0.3
+        final_confidence = clamp01((0.6 * llm_confidence) + (0.4 * similarity))
+        correct_points: list[str] = []
+        wrong_points = ["The answer does not address the key concepts from the answer key."]
+        missing_concepts = ["Key concepts from the answer key were not covered."]
+        strong_topics, weak_topics, topics = derive_topics_from_points(correct_points, wrong_points, missing_concepts)
+        mistakes = normalize_concept_list(wrong_points + missing_concepts, 20)
+        suggestions = ["Focus on the core concepts required by the question and answer key."]
+        marks, feedback, mistakes, suggestions = apply_similarity_penalty(
             marks=2,
             feedback="The submitted content does not answer the question and appears unrelated.",
-            mistakes=["The response does not address the key concepts in the question."],
-            suggestions=["Focus on the exact question keywords and answer the asked concept directly."],
-            confidence=0.9,
+            mistakes=mistakes,
+            suggestions=suggestions,
+            similarity=similarity,
+        )
+        return EvaluateResponse(
+            marks=marks,
+            score=marks,
+            feedback=feedback,
+            correct_points=correct_points,
+            wrong_points=wrong_points,
+            missing_concepts=missing_concepts,
+            strong_topics=strong_topics,
+            weak_topics=weak_topics,
+            mistakes=mistakes,
+            suggestions=suggestions,
+            confidence=final_confidence,
+            topics=topics,
         )
 
     load_dotenv()
@@ -135,72 +450,57 @@ def run_evaluation(payload: EvaluateRequest) -> EvaluateResponse:
     if not api_key:
         raise HTTPException(status_code=500, detail="OPENROUTER_API_KEY is not set")
 
-    prompt = f"""
-You are an academic evaluator grading a student's answer.
+    system_prompt = """
+You are a strict academic evaluator.
 
-IMPORTANT:
-- Return STRICT JSON only.
-- Do not include markdown.
-- Do not include code fences.
-- Do not include any extra text before or after JSON.
-- Output must be exactly one JSON object.
+You MUST:
+- Compare student answer with answer key
+- Identify concepts (not sentences)
+- Penalize incorrect statements heavily
+- Reward correctness proportionally
+- NEVER give random marks
+- Avoid vague statements and generic feedback
+""".strip()
 
-Grading rubric:
-- 9-10: Almost perfect, matches key concepts
-- 6-8: Partially correct, some missing ideas
-- 3-5: Basic understanding but major gaps
-- 0-2: Incorrect or very poor answer
+    user_prompt = f"""
+Question:
+{question}
 
-Strict grading rule:
-- If the student's answer is unrelated to the question or clearly incorrect, assign marks below 3.
-- Do not give generous marks for irrelevant, generic, or off-topic responses.
-- If the student_answer is unrelated, irrelevant, or does not address the question, assign very low marks (0-3) and explicitly state that the answer is irrelevant.
-- DO NOT assume missing information. Only evaluate based on the provided student_answer.
-- If the student_answer is unrelated, irrelevant, or does not address the question, assign very low marks (0-3) and explicitly state that the answer is irrelevant.
+Answer Key:
+{reference_answer}
 
-Evaluation scope rule:
-- DO NOT assume missing information. Only evaluate based on the provided student_answer.
+Student Answer:
+{student_answer}
 
-Evaluation instructions:
-1) Identify specific mistakes in the student's answer.
-2) Identify missing concepts compared to the reference answer.
-3) Suggest concrete improvements the student can apply.
-4) Provide detailed feedback in at least 4-5 sentences explaining strengths, weaknesses, and improvements.
+---
 
-Feedback quality rules:
-- feedback must be at least 4-5 complete sentences.
-- Explicitly mention:
-  a) what is correct in the student's answer,
-  b) what is missing compared to the reference answer,
-  c) what is incorrect or misleading,
-  d) specific suggestions to improve the answer.
-- Keep feedback constructive, specific, and academic.
-- Do not change the JSON schema; keep the same keys.
+TASK:
 
-Mistake quality rules:
-- Be specific and concept-level.
-- Do NOT use vague phrases like "Incomplete definition" or "Needs more detail".
-- Each mistake must name the exact missing or incorrect concept.
-- Keep each mistake short and clear (one line each).
+1. Extract key concepts from answer key
+2. For each concept:
+   - Check if student covered it correctly, incorrectly, or missed it
 
-Example:
-- Bad: "Incomplete definition"
-- Good: "Did not mention simulation of human intelligence"
-
-Evaluate:
-Question: {payload.question}
-Student Answer: {payload.student_answer}
-Reference Answer: {payload.reference_answer}
-
-Example output JSON:
+3. Output STRICT JSON:
 {{
-  "marks": 7.5,
-  "feedback": "The answer correctly identifies one core concept and shows partial understanding of the topic. However, it misses important supporting points that are present in the reference answer. A few statements are oversimplified and one claim is technically inaccurate. To improve, include the missing mechanisms and define key terms more precisely. Add one concrete example to demonstrate complete understanding.",
-  "mistakes": ["Confuses key term A with term B", "States an incomplete definition"],
-  "suggestions": ["Define term A clearly in one sentence", "Add the missing concept about mechanism C"],
-  "confidence": 0.84
+  "score": 0,
+  "correct_points": [],
+  "wrong_points": [],
+  "missing_concepts": [],
+  "strong_topics": [],
+  "weak_topics": [],
+  "feedback": "detailed paragraph explaining performance",
+  "confidence": 0.0,
+  "mistakes": []
 }}
-"""
+
+RULES:
+- If student includes wrong statements -> reduce score significantly
+- If answer is partially correct -> mid score (4-7)
+- If mostly correct -> high score (7-10)
+- If irrelevant -> score < 3
+- Concepts must be short technical phrases, not full sentences
+- Return JSON only, no markdown, no code fences, no extra text.
+""".strip()
 
     try:
         response = requests.post(
@@ -214,7 +514,8 @@ Example output JSON:
             json={
                 "model": "mistralai/mistral-7b-instruct-v0.1",
                 "messages": [
-                    {"role": "user", "content": prompt},
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
                 ],
                 "temperature": 0,
             },
@@ -260,30 +561,119 @@ Example output JSON:
         if isinstance(parsed, str):
             parsed = json_lib.loads(parsed)
 
-        mistakes = parsed.get("mistakes", [])
-        suggestions = parsed.get("suggestions", [])
-        if not isinstance(mistakes, list):
-            mistakes = [str(mistakes)] if mistakes else []
-        if not isinstance(suggestions, list):
-            suggestions = [str(suggestions)] if suggestions else []
+        def ensure_list(value: object) -> list[str]:
+            if isinstance(value, list):
+                return [str(item) for item in value]
+            if value is None:
+                return []
+            text_value = clean_text(str(value))
+            return [text_value] if text_value else []
+
+        correct_points = normalize_concept_list(ensure_list(parsed.get("correct_points", [])), 20)
+        wrong_points = normalize_concept_list(ensure_list(parsed.get("wrong_points", [])), 20)
+        missing_concepts = normalize_concept_list(ensure_list(parsed.get("missing_concepts", [])), 20)
+        strong_topics, weak_topics, topics = derive_topics_from_points(correct_points, wrong_points, missing_concepts)
+
+        feedback_text = clean_text(str(parsed.get("feedback", "")).strip())
+        if not feedback_text:
+            parts: list[str] = []
+            if correct_points:
+                parts.append("Correct concepts: " + "; ".join(correct_points))
+            if wrong_points:
+                parts.append("Incorrect concepts: " + "; ".join(wrong_points))
+            if missing_concepts:
+                parts.append("Missing concepts: " + "; ".join(missing_concepts))
+            feedback_text = " ".join(parts).strip() or "Concept-level evaluation completed."
+
+        derived_suggestions: list[str] = normalize_concept_list(missing_concepts[:4] + wrong_points[:3], 8)
+
+        parsed_mistakes = normalize_concept_list(ensure_list(parsed.get("mistakes", [])), 20)
+        cleaned_mistakes = normalize_concept_list(parsed_mistakes + wrong_points + missing_concepts, 25)
+        cleaned_suggestions = derived_suggestions
+
+        try:
+            llm_confidence = clamp01(float(parsed.get("confidence", 0.6)))
+        except (ValueError, TypeError):
+            llm_confidence = 0.6
+        final_confidence = clamp01((0.6 * llm_confidence) + (0.4 * similarity))
+
+        try:
+            marks = float(parsed.get("score", parsed.get("marks", 0)))
+        except (ValueError, TypeError):
+            marks = 0.0
+        marks = enforce_structured_score(
+            raw_score=marks,
+            correct_points=correct_points,
+            wrong_points=wrong_points,
+            missing_concepts=missing_concepts,
+            student_answer=student_answer,
+            reference_answer=reference_answer,
+        )
+
+        feedback = feedback_text
+        has_any_correct_points = len(correct_points) > 0
+        marks, feedback, cleaned_mistakes, cleaned_suggestions = apply_similarity_penalty(
+            marks=marks,
+            feedback=feedback,
+            mistakes=cleaned_mistakes,
+            suggestions=cleaned_suggestions,
+            similarity=similarity,
+            allow_not_relevant_feedback=not has_any_correct_points,
+        )
+        if has_any_correct_points:
+            feedback = re.sub(r"(?i)\banswer not relevant\.?\b", "", feedback).strip()
+            feedback = re.sub(r"\s{2,}", " ", feedback)
+            cleaned_mistakes = [
+                item for item in cleaned_mistakes
+                if "not relevant" not in item.lower()
+            ]
 
         return EvaluateResponse(
-            marks=float(parsed["marks"]),
-            feedback=str(parsed["feedback"]),
-            mistakes=[str(item).strip() for item in mistakes if str(item).strip()],
-            suggestions=[str(item).strip() for item in suggestions if str(item).strip()],
-            confidence=float(parsed["confidence"]),
+            marks=marks,
+            score=marks,
+            feedback=feedback,
+            correct_points=correct_points,
+            wrong_points=wrong_points,
+            missing_concepts=missing_concepts,
+            strong_topics=strong_topics,
+            weak_topics=weak_topics,
+            mistakes=cleaned_mistakes,
+            suggestions=cleaned_suggestions,
+            confidence=final_confidence,
+            topics=topics,
         )
     except (ValueError, KeyError, TypeError):
         fallback_text = output_text.strip()
         if not fallback_text:
             fallback_text = "Model response could not be parsed into JSON."
-        return EvaluateResponse(
+        llm_confidence = 0.6
+        final_confidence = clamp01((0.6 * llm_confidence) + (0.4 * similarity))
+        correct_points: list[str] = []
+        wrong_points = ["The evaluator could not parse concept-level output."]
+        missing_concepts: list[str] = []
+        strong_topics, weak_topics, topics = derive_topics_from_points(correct_points, wrong_points, missing_concepts)
+        mistakes = normalize_concept_list(wrong_points, 10)
+        suggestions = ["Resubmit with clearer concept-focused content for reliable grading."]
+        marks, feedback, mistakes, suggestions = apply_similarity_penalty(
             marks=5,
             feedback=fallback_text,
-            mistakes=[],
-            suggestions=[],
-            confidence=0.6,
+            mistakes=mistakes,
+            suggestions=suggestions,
+            similarity=similarity,
+        )
+        return EvaluateResponse(
+            marks=marks,
+            score=marks,
+            feedback=feedback,
+            correct_points=correct_points,
+            wrong_points=wrong_points,
+            missing_concepts=missing_concepts,
+            strong_topics=strong_topics,
+            weak_topics=weak_topics,
+            mistakes=mistakes,
+            suggestions=suggestions,
+            confidence=final_confidence,
+            topics=topics,
         )
 
 
@@ -535,6 +925,13 @@ def answer_with_context(payload: AnswerWithContextRequest) -> AnswerWithContextR
 
     question = (payload.question or "").strip()
     contexts = [str(item).strip() for item in payload.contexts if str(item).strip()]
+    proficiency_level = (payload.proficiency_level or "intermediate").strip().lower()
+    if proficiency_level not in {"beginner", "intermediate", "advanced"}:
+        proficiency_level = "intermediate"
+    weak_topics = [str(item).strip() for item in (payload.weak_topics or []) if str(item).strip()]
+    weak_topics = weak_topics[:8]
+    recent_mistakes = [str(item).strip() for item in (payload.recent_mistakes or []) if str(item).strip()]
+    recent_mistakes = recent_mistakes[:8]
     if not question:
         raise HTTPException(status_code=400, detail="question is required")
     if not contexts:
@@ -551,13 +948,24 @@ You are a helpful course tutor chatbot.
 Your knowledge boundary is strict:
 - Use ONLY the provided course context chunks.
 - Do NOT use outside knowledge, assumptions, or prior world facts.
+- STRICT: If the answer is unrelated to course context, say clearly:
+  "This question is unrelated to the provided course context."
 - If the answer is not present in context, clearly say it is not available in uploaded course materials.
 
 Teaching style requirements:
-- Explain in a student-friendly way.
-- Prefer short step-by-step explanations when useful.
-- Use simple examples only if those examples are supported by the provided context.
-- Keep the answer focused and avoid unnecessary verbosity.
+- Keep the answer student-friendly and focused.
+- Do not invent facts not present in context.
+
+Adaptive response requirements:
+- Student proficiency level: {proficiency_level}
+- Mandatory style rules for this level:
+{adaptation_instructions(proficiency_level)}
+- Weak topics for this student:
+{json_lib.dumps(weak_topics, ensure_ascii=False)}
+- Recent repeated mistakes:
+{json_lib.dumps(recent_mistakes, ensure_ascii=False)}
+- Mistake-aware guidance:
+  - If the current question overlaps weak_topics or recent_mistakes, add extra clarification and one targeted corrective tip.
 
 Return STRICT JSON only with this schema:
 {{
@@ -619,13 +1027,11 @@ Course context chunks:
 @app.post("/evaluate-file", response_model=EvaluateFileDetailedResponse)
 async def evaluate_file(
     file: UploadFile = File(...),
-    reference_answer: str = Form(...),
+    reference_answer: str = Form(""),
     question: str = Form(""),
 ) -> EvaluateFileDetailedResponse:
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Please upload a PDF file")
-    if not reference_answer or not reference_answer.strip():
-        raise HTTPException(status_code=400, detail="reference_answer is required")
 
     try:
         file_bytes = await file.read()
@@ -658,10 +1064,17 @@ async def evaluate_file(
                 QuestionWiseResult(
                     question=question,
                     marks=single_result.marks,
+                    score=single_result.score,
                     feedback=single_result.feedback,
+                    correct_points=single_result.correct_points,
+                    wrong_points=single_result.wrong_points,
+                    missing_concepts=single_result.missing_concepts,
+                    strong_topics=single_result.strong_topics,
+                    weak_topics=single_result.weak_topics,
                     mistakes=single_result.mistakes,
                     suggestions=single_result.suggestions,
                     confidence=single_result.confidence,
+                    topics=single_result.topics,
                 )
             ],
             total_marks=single_result.marks,
@@ -687,10 +1100,17 @@ async def evaluate_file(
                 QuestionWiseResult(
                     question="Full submission response",
                     marks=single_result.marks,
+                    score=single_result.score,
                     feedback=single_result.feedback,
+                    correct_points=single_result.correct_points,
+                    wrong_points=single_result.wrong_points,
+                    missing_concepts=single_result.missing_concepts,
+                    strong_topics=single_result.strong_topics,
+                    weak_topics=single_result.weak_topics,
                     mistakes=single_result.mistakes,
                     suggestions=single_result.suggestions,
                     confidence=single_result.confidence,
+                    topics=single_result.topics,
                 )
             ],
             total_marks=single_result.marks,
@@ -747,10 +1167,17 @@ def evaluate_multiple(payload: EvaluateMultipleRequest) -> EvaluateMultipleRespo
             QuestionWiseResult(
                 question=question_payload.question,
                 marks=evaluation.marks,
+                score=evaluation.score,
                 feedback=evaluation.feedback,
+                correct_points=evaluation.correct_points,
+                wrong_points=evaluation.wrong_points,
+                missing_concepts=evaluation.missing_concepts,
+                strong_topics=evaluation.strong_topics,
+                weak_topics=evaluation.weak_topics,
                 mistakes=evaluation.mistakes,
                 suggestions=evaluation.suggestions,
                 confidence=evaluation.confidence,
+                topics=evaluation.topics,
             )
         )
         total_marks += evaluation.marks

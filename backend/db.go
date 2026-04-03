@@ -72,6 +72,11 @@ END $$;
 		&Submission{},
 		&Evaluation{},
 		&CourseMaterial{},
+		&StudentProfile{},
+		&StudentInteraction{},
+		&StudentMistakeStat{},
+		&StudentStrengthStat{},
+		&StudentChatTopicStat{},
 	); err != nil {
 		log.Fatalf("failed to run automigrate: %v", err)
 	}

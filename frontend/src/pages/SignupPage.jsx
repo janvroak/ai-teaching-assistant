@@ -462,7 +462,7 @@ function SignupPage() {
               <div className="su-input-wrap">
                 <input
                   type="text"
-                  className="su-input"
+                  className="su-input bg-[#1F2937] text-white placeholder-gray-400 border border-gray-700"
                   placeholder="Jane Smith"
                   value={name}
                   onChange={(e) => setName(e.target.value)}
@@ -477,7 +477,7 @@ function SignupPage() {
               <div className="su-input-wrap">
                 <input
                   type="email"
-                  className="su-input"
+                  className="su-input bg-[#1F2937] text-white placeholder-gray-400 border border-gray-700"
                   placeholder="you@example.com"
                   value={email}
                   onChange={(e) => setEmail(e.target.value)}
@@ -492,7 +492,7 @@ function SignupPage() {
               <div className="su-input-wrap">
                 <input
                   type="password"
-                  className="su-input"
+                  className="su-input bg-[#1F2937] text-white placeholder-gray-400 border border-gray-700"
                   placeholder="••••••••"
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}

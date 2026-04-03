@@ -445,7 +445,7 @@ function DashboardPage() {
                     onChange={(e) => setCourseName(e.target.value)}
                     onKeyDown={(e) => e.key === 'Enter' && handleCreateCourse()}
                     placeholder="Course name"
-                    className="db-input"
+                    className="db-input bg-[#1F2937] text-white placeholder-gray-400 border border-gray-700"
                   />
                 </div>
                 <button onClick={handleCreateCourse} className="db-btn">Create Course →</button>
@@ -462,7 +462,7 @@ function DashboardPage() {
                     onChange={(e) => setCourseCode(e.target.value)}
                     onKeyDown={(e) => e.key === 'Enter' && handleJoinCourse()}
                     placeholder="Course code (e.g. ABC123)"
-                    className="db-input"
+                    className="db-input bg-[#1F2937] text-white placeholder-gray-400 border border-gray-700"
                   />
                 </div>
                 <button onClick={handleJoinCourse} className="db-btn">Join Course →</button>

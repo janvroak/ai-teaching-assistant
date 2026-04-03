@@ -415,7 +415,7 @@ export default function Login() {
                 <div className="login-input-wrap">
                   <input
                     type="email"
-                    className="login-input"
+                    className="login-input bg-[#1F2937] text-white placeholder-gray-400 border border-gray-700"
                     placeholder="you@example.com"
                     value={email}
                     onChange={(e) => setEmail(e.target.value)}
@@ -430,7 +430,7 @@ export default function Login() {
                 <div className="login-input-wrap">
                   <input
                     type="password"
-                    className="login-input"
+                    className="login-input bg-[#1F2937] text-white placeholder-gray-400 border border-gray-700"
                     placeholder="••••••••"
                     value={password}
                     onChange={(e) => setPassword(e.target.value)}

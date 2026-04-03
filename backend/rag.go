@@ -21,18 +21,22 @@ import (
 )
 
 type CreateCourseMaterialResponse struct {
-	ID       uint   `json:"id"`
-	Title    string `json:"title"`
-	HasFile  bool   `json:"has_file"`
-	FileURL  string `json:"file_url,omitempty"`
-	CourseID uint   `json:"course_id"`
+	ID         uint      `json:"id"`
+	Title      string    `json:"title"`
+	HasFile    bool      `json:"has_file"`
+	FileURL    string    `json:"file_url,omitempty"`
+	CourseID   uint      `json:"course_id"`
+	UploadedBy string    `json:"uploaded_by,omitempty"`
+	CreatedAt  time.Time `json:"created_at"`
 }
 
 type CourseMaterialListItem struct {
-	ID      uint   `json:"id"`
-	Title   string `json:"title"`
-	HasFile bool   `json:"has_file"`
-	FileURL string `json:"file_url,omitempty"`
+	ID         uint      `json:"id"`
+	Title      string    `json:"title"`
+	HasFile    bool      `json:"has_file"`
+	FileURL    string    `json:"file_url,omitempty"`
+	UploadedBy string    `json:"uploaded_by,omitempty"`
+	CreatedAt  time.Time `json:"created_at"`
 }
 
 type AskDoubtRequest struct {
@@ -40,14 +44,40 @@ type AskDoubtRequest struct {
 }
 
 type RAGAnswerRequest struct {
-	Question string   `json:"question"`
-	Contexts []string `json:"contexts"`
+	Question         string   `json:"question"`
+	Contexts         []string `json:"contexts"`
+	ProficiencyLevel string   `json:"proficiency_level,omitempty"`
+	WeakTopics       []string `json:"weak_topics,omitempty"`
+	RecentMistakes   []string `json:"recent_mistakes,omitempty"`
 }
 
 type RAGAnswerResponse struct {
-	Answer     string   `json:"answer"`
-	Confidence float64  `json:"confidence"`
-	Citations  []string `json:"citations"`
+	Answer     string                 `json:"answer"`
+	Confidence float64                `json:"confidence"`
+	Citations  []string               `json:"citations"`
+	AdaptedFor string                 `json:"adapted_for,omitempty"`
+	Profile    *StudentProfileSummary `json:"profile,omitempty"`
+}
+
+type StudentProfileSummary struct {
+	ProficiencyLevel string   `json:"proficiency_level"`
+	AvgScore         float64  `json:"avg_score"`
+	TotalSubmissions int      `json:"total_submissions"`
+	TotalAssignments int      `json:"total_assignments"`
+	WeakTopics       []string `json:"weak_topics"`
+	StrongTopics     []string `json:"strong_topics"`
+	Progress         float64  `json:"progress"`
+	ProgressLabel    string   `json:"progress_label"`
+	Trend            string   `json:"trend"`
+}
+
+type ChatHistoryItem struct {
+	ID        uint      `json:"id"`
+	Question  string    `json:"question"`
+	Answer    string    `json:"answer"`
+	StudentID uint      `json:"student_id"`
+	CourseID  uint      `json:"course_id"`
+	Timestamp time.Time `json:"timestamp"`
 }
 
 func CreateCourseMaterialHandler(c *gin.Context) {
@@ -123,10 +153,12 @@ func CreateCourseMaterialHandler(c *gin.Context) {
 	}
 
 	resp := CreateCourseMaterialResponse{
-		ID:       material.ID,
-		Title:    material.Title,
-		HasFile:  strings.TrimSpace(material.FilePath) != "",
-		CourseID: material.CourseID,
+		ID:         material.ID,
+		Title:      material.Title,
+		HasFile:    strings.TrimSpace(material.FilePath) != "",
+		CourseID:   material.CourseID,
+		UploadedBy: "Professor",
+		CreatedAt:  material.CreatedAt,
 	}
 	if resp.HasFile {
 		resp.FileURL = fmt.Sprintf("/materials/%d/file", material.ID)
@@ -141,7 +173,7 @@ func ListCourseMaterialsHandler(c *gin.Context) {
 		return
 	}
 
-	courseID, _, role, ok := requireCourseAccess(c)
+	courseID, _, _, ok := requireCourseAccess(c)
 	if !ok {
 		return
 	}
@@ -152,12 +184,26 @@ func ListCourseMaterialsHandler(c *gin.Context) {
 		return
 	}
 
+	uploadedBy := "Professor"
+	var course Course
+	if err := DB.Where("id = ?", courseID).First(&course).Error; err == nil {
+		var professor User
+		if err := DB.Where("id = ?", course.ProfessorID).First(&professor).Error; err == nil {
+			name := strings.TrimSpace(professor.Name)
+			if name != "" {
+				uploadedBy = name
+			}
+		}
+	}
+
 	response := make([]CourseMaterialListItem, 0, len(materials))
 	for _, material := range materials {
 		item := CourseMaterialListItem{
-			ID:      material.ID,
-			Title:   material.Title,
-			HasFile: strings.TrimSpace(material.FilePath) != "",
+			ID:         material.ID,
+			Title:      material.Title,
+			HasFile:    strings.TrimSpace(material.FilePath) != "",
+			UploadedBy: uploadedBy,
+			CreatedAt:  material.CreatedAt,
 		}
 		if item.HasFile {
 			item.FileURL = fmt.Sprintf("/materials/%d/file", material.ID)
@@ -165,7 +211,6 @@ func ListCourseMaterialsHandler(c *gin.Context) {
 		response = append(response, item)
 	}
 
-	_ = role
 	c.JSON(http.StatusOK, response)
 }
 
@@ -175,7 +220,7 @@ func AskCourseDoubtHandler(c *gin.Context) {
 		return
 	}
 
-	courseID, _, _, ok := requireCourseAccess(c)
+	courseID, userID, role, ok := requireCourseAccess(c)
 	if !ok {
 		return
 	}
@@ -258,12 +303,78 @@ func AskCourseDoubtHandler(c *gin.Context) {
 		}
 	}
 
-	answer, err := askAIWithContext(question, contexts)
+	proficiencyLevel := "intermediate"
+	avgScore := 0.0
+	totalSubmissions := 0
+	weakTopics := []string{}
+	strongTopics := []string{}
+	recentMistakes := []string{}
+	if role == "student" {
+		profile, err := getOrBuildAdaptiveProfile(userID, courseID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to build student profile"})
+			return
+		}
+		proficiencyLevel = profile.ProficiencyLevel
+		avgScore = profile.AvgScore
+		totalSubmissions = profile.TotalSubmissions
+		weakTopics = parseTopicsJSON(profile.WeakTopics)
+		strongTopics = parseTopicsJSON(profile.StrongTopics)
+
+		mistakes, err := listRecentMistakes(userID, courseID, 5)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to load recent mistakes"})
+			return
+		}
+		recentMistakes = mistakes
+	}
+
+	trend := "improving"
+	progress := 0.0
+	progressLabelValue := "Beginner"
+	totalAssignments := 0
+	if role == "student" {
+		value, err := learningTrend(userID, courseID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to calculate learning trend"})
+			return
+		}
+		trend = value
+
+		completion, completionLabel, assignmentCount, err := courseProgressForStudent(userID, courseID, totalSubmissions)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to calculate course progress"})
+			return
+		}
+		progress = completion
+		progressLabelValue = completionLabel
+		totalAssignments = assignmentCount
+	}
+
+	answer, err := askAIWithContext(question, contexts, proficiencyLevel, weakTopics, recentMistakes)
 	if err != nil {
 		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
 		return
 	}
 	answer.Citations = citations
+	answer.AdaptedFor = proficiencyLevel
+	if role == "student" {
+		answer.Profile = &StudentProfileSummary{
+			ProficiencyLevel: proficiencyLevel,
+			AvgScore:         avgScore,
+			TotalSubmissions: totalSubmissions,
+			TotalAssignments: totalAssignments,
+			WeakTopics:       weakTopics,
+			StrongTopics:     strongTopics,
+			Progress:         progress,
+			ProgressLabel:    progressLabelValue,
+			Trend:            trend,
+		}
+		if err := saveStudentInteraction(userID, courseID, question, answer.Answer, proficiencyLevel); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to record student interaction"})
+			return
+		}
+	}
 	c.JSON(http.StatusOK, answer)
 }
 
@@ -303,10 +414,13 @@ func GetCourseMaterialFileHandler(c *gin.Context) {
 	c.File(material.FilePath)
 }
 
-func askAIWithContext(question string, contexts []string) (RAGAnswerResponse, error) {
+func askAIWithContext(question string, contexts []string, proficiencyLevel string, weakTopics []string, recentMistakes []string) (RAGAnswerResponse, error) {
 	payload := RAGAnswerRequest{
-		Question: question,
-		Contexts: contexts,
+		Question:         question,
+		Contexts:         contexts,
+		ProficiencyLevel: proficiencyLevel,
+		WeakTopics:       weakTopics,
+		RecentMistakes:   recentMistakes,
 	}
 	requestBytes, err := json.Marshal(payload)
 	if err != nil {
@@ -425,6 +539,133 @@ func saveCourseMaterialFile(fileHeader *multipart.FileHeader) (string, error) {
 
 func parsedNowUnixNano() int64 {
 	return time.Now().UnixNano()
+}
+
+func GetStudentProfileHandler(c *gin.Context) {
+	if DB == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database is not initialized"})
+		return
+	}
+
+	courseID, userID, role, ok := requireCourseAccess(c)
+	if !ok {
+		return
+	}
+	if role != "student" {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Only students can access adaptive profile"})
+		return
+	}
+
+	profile, err := recomputeAdaptiveProfile(DB, userID, courseID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch profile"})
+		return
+	}
+	trend, err := learningTrend(userID, courseID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to calculate trend"})
+		return
+	}
+	progress, label, totalAssignments, err := courseProgressForStudent(userID, courseID, profile.TotalSubmissions)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to calculate course progress"})
+		return
+	}
+
+	c.JSON(http.StatusOK, StudentProfileSummary{
+		ProficiencyLevel: profile.ProficiencyLevel,
+		AvgScore:         profile.AvgScore,
+		TotalSubmissions: profile.TotalSubmissions,
+		TotalAssignments: totalAssignments,
+		WeakTopics:       parseTopicsJSON(profile.WeakTopics),
+		StrongTopics:     parseTopicsJSON(profile.StrongTopics),
+		Progress:         progress,
+		ProgressLabel:    label,
+		Trend:            trend,
+	})
+}
+
+func GetCourseChatHistoryHandler(c *gin.Context) {
+	if DB == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database is not initialized"})
+		return
+	}
+
+	courseID, userID, role, ok := requireCourseAccess(c)
+	if !ok {
+		return
+	}
+	if role != "student" {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Only students can access chat history"})
+		return
+	}
+
+	var interactions []StudentInteraction
+	if err := DB.Where("student_id = ? AND course_id = ? AND interaction_type = ?", userID, courseID, "doubt").
+		Order("id ASC").
+		Find(&interactions).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch chat history"})
+		return
+	}
+
+	items := make([]ChatHistoryItem, 0, len(interactions))
+	for _, interaction := range interactions {
+		items = append(items, ChatHistoryItem{
+			ID:        interaction.ID,
+			Question:  interaction.Question,
+			Answer:    interaction.Response,
+			StudentID: interaction.StudentID,
+			CourseID:  interaction.CourseID,
+			Timestamp: interaction.CreatedAt,
+		})
+	}
+
+	c.JSON(http.StatusOK, items)
+}
+
+func listRecentInteractionQuestions(studentID uint, courseID uint, limit int) ([]string, error) {
+	if limit <= 0 {
+		limit = 5
+	}
+	var interactions []StudentInteraction
+	if err := DB.Where("student_id = ? AND course_id = ?", studentID, courseID).
+		Order("id DESC").
+		Limit(limit).
+		Find(&interactions).Error; err != nil {
+		return nil, err
+	}
+
+	history := make([]string, 0, len(interactions))
+	for _, item := range interactions {
+		question := strings.TrimSpace(item.Question)
+		if question == "" {
+			continue
+		}
+		history = append(history, question)
+	}
+	return history, nil
+}
+
+func saveStudentInteraction(studentID uint, courseID uint, question string, response string, proficiencyLevel string) error {
+	interaction := StudentInteraction{
+		StudentID:        studentID,
+		CourseID:         courseID,
+		InteractionType:  "doubt",
+		Question:         strings.TrimSpace(question),
+		Response:         strings.TrimSpace(response),
+		ProficiencyLevel: strings.TrimSpace(proficiencyLevel),
+	}
+	return DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(&interaction).Error; err != nil {
+			return err
+		}
+		for _, topic := range extractTopicKeywords(question, 5) {
+			if err := incrementChatTopicStat(tx, studentID, courseID, topic); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 func requireProfessorOwnsCourse(c *gin.Context) (uint, uint, bool) {
