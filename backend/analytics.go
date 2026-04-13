@@ -15,19 +15,37 @@ type StudentAnalytics struct {
 	CourseID         uint     `json:"course_id"`
 	AvgScore         float64  `json:"avg_score"`
 	TotalSubmissions int      `json:"total_submissions"`
+	Progress         float64  `json:"progress"`
+	ProgressStatus   string   `json:"progress_status"`
+	ProgressEstimated bool    `json:"progress_estimated"`
+	ProgressNote     string   `json:"progress_note,omitempty"`
+	Trend            string   `json:"trend"`
 	Rank             int      `json:"rank"`
 	Percentile       float64  `json:"percentile"`
 	StrongTopics     []string `json:"strong_topics"`
 	WeakTopics       []string `json:"weak_topics"`
 }
 
+type AtRiskStudent struct {
+	UserID         uint    `json:"user_id"`
+	Name           string  `json:"name"`
+	AvgScore       float64 `json:"avg_score"`
+	Progress       float64 `json:"progress"`
+	ProgressStatus string  `json:"progress_status"`
+	Trend          string  `json:"trend"`
+}
+
 type CourseAnalytics struct {
-	CourseID      uint                 `json:"course_id"`
-	AvgScore      float64              `json:"avg_score"`
-	TotalStudents int                  `json:"total_students"`
-	TopPerformer  *TopPerformerSummary `json:"top_performer,omitempty"`
-	WeakTopics    []string             `json:"weak_topics"`
-	StrongTopics  []string             `json:"strong_topics"`
+	CourseID                uint                 `json:"course_id"`
+	AvgScore                float64              `json:"avg_score"`
+	AverageProgress         float64              `json:"average_progress"`
+	TotalStudents           int                  `json:"total_students"`
+	TopPerformer            *TopPerformerSummary `json:"top_performer,omitempty"`
+	WeakTopics              []string             `json:"weak_topics"`
+	StrongTopics            []string             `json:"strong_topics"`
+	PerformanceDistribution map[string]int       `json:"performance_distribution"`
+	ProgressDistribution    map[string]int       `json:"progress_distribution"`
+	AtRiskStudents          []AtRiskStudent      `json:"at_risk_students"`
 }
 
 type TopPerformerSummary struct {
@@ -98,6 +116,14 @@ func computeCourseAnalyticsSnapshot(courseID uint) ([]StudentAnalytics, CourseAn
 
 		weakTopics := parseTopicsJSON(profile.WeakTopics)
 		strongTopics := parseTopicsJSON(profile.StrongTopics)
+		progress, status, _, estimated, note, err := courseProgressForStudent(studentID, courseID, int(aggregate.TotalSubmissions))
+		if err != nil {
+			return nil, CourseAnalytics{}, err
+		}
+		trend, err := learningTrend(studentID, courseID)
+		if err != nil {
+			return nil, CourseAnalytics{}, err
+		}
 
 		studentAnalytics = append(studentAnalytics, StudentAnalytics{
 			UserID:           studentID,
@@ -105,13 +131,21 @@ func computeCourseAnalyticsSnapshot(courseID uint) ([]StudentAnalytics, CourseAn
 			CourseID:         courseID,
 			AvgScore:         aggregate.AvgScore,
 			TotalSubmissions: int(aggregate.TotalSubmissions),
+			Progress:         progress,
+			ProgressStatus:   status,
+			ProgressEstimated: estimated,
+			ProgressNote:     note,
+			Trend:            trend,
 			StrongTopics:     strongTopics,
 			WeakTopics:       weakTopics,
 		})
 	}
 
-	// Ranking logic (as requested): sort only by avg score descending.
+	// Ranking logic: sort by average score descending and assign tie-aware ranks.
 	sort.Slice(studentAnalytics, func(i, j int) bool {
+		if studentAnalytics[i].AvgScore == studentAnalytics[j].AvgScore {
+			return studentAnalytics[i].UserID < studentAnalytics[j].UserID
+		}
 		return studentAnalytics[i].AvgScore > studentAnalytics[j].AvgScore
 	})
 
@@ -132,8 +166,18 @@ func computeCourseAnalyticsSnapshot(courseID uint) ([]StudentAnalytics, CourseAn
 	if totalStudentsFloat <= 0 {
 		totalStudentsFloat = 1
 	}
+	lastScore := math.NaN()
+	lastRank := 0
 	for index := range studentAnalytics {
-		studentAnalytics[index].Rank = index + 1
+		currentScore := studentAnalytics[index].AvgScore
+		if index == 0 {
+			lastRank = 1
+			lastScore = currentScore
+		} else if currentScore != lastScore {
+			lastRank = index + 1
+			lastScore = currentScore
+		}
+		studentAnalytics[index].Rank = lastRank
 		studentAnalytics[index].Percentile = (float64(studentAnalytics[index].Rank) / totalStudentsFloat) * 100.0
 	}
 
@@ -209,14 +253,66 @@ func computeCourseAnalyticsSnapshot(courseID uint) ([]StudentAnalytics, CourseAn
 		}
 	}
 
-	const topicFrequencyThreshold = 1 // include topics where frequency > threshold
+	const topicMinCount = 1
+	atRisk := make([]AtRiskStudent, 0)
+	performanceDistribution := map[string]int{
+		"high":   0,
+		"medium": 0,
+		"low":    0,
+	}
+	progressDistribution := map[string]int{
+		"Not Started": 0,
+		"In Progress": 0,
+		"Evaluated":   0,
+		"Mastered":    0,
+	}
+	totalProgress := 0.0
+	for _, student := range studentAnalytics {
+		switch {
+		case student.AvgScore >= 7:
+			performanceDistribution["high"]++
+		case student.AvgScore >= 4:
+			performanceDistribution["medium"]++
+		default:
+			performanceDistribution["low"]++
+		}
+		progressDistribution[student.ProgressStatus]++
+		totalProgress += student.Progress
+
+		if student.Progress < 40 || student.AvgScore < 4 || student.Trend == "declining" {
+			atRisk = append(atRisk, AtRiskStudent{
+				UserID:         student.UserID,
+				Name:           student.Name,
+				AvgScore:       student.AvgScore,
+				Progress:       student.Progress,
+				ProgressStatus: student.ProgressStatus,
+				Trend:          student.Trend,
+			})
+		}
+	}
+	sort.Slice(atRisk, func(i, j int) bool {
+		if atRisk[i].Progress == atRisk[j].Progress {
+			return atRisk[i].AvgScore < atRisk[j].AvgScore
+		}
+		return atRisk[i].Progress < atRisk[j].Progress
+	})
+
+	avgProgress := 0.0
+	if len(studentAnalytics) > 0 {
+		avgProgress = totalProgress / float64(len(studentAnalytics))
+	}
+
 	courseAnalytics := CourseAnalytics{
-		CourseID:      courseID,
-		AvgScore:      courseAverage,
-		TotalStudents: totalStudents,
-		TopPerformer:  topPerformer,
-		WeakTopics:    topTopicsByFrequency(weakTopicCounts, 5, topicFrequencyThreshold+1),
-		StrongTopics:  topTopicsByFrequency(strongTopicCounts, 5, topicFrequencyThreshold+1),
+		CourseID:                courseID,
+		AvgScore:                courseAverage,
+		AverageProgress:         avgProgress,
+		TotalStudents:           totalStudents,
+		TopPerformer:            topPerformer,
+		WeakTopics:              topTopicsByFrequency(weakTopicCounts, 5, topicMinCount),
+		StrongTopics:            topTopicsByFrequency(strongTopicCounts, 5, topicMinCount),
+		PerformanceDistribution: performanceDistribution,
+		ProgressDistribution:    progressDistribution,
+		AtRiskStudents:          atRisk,
 	}
 
 	return studentAnalytics, courseAnalytics, nil

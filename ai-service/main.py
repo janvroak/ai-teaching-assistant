@@ -2,16 +2,21 @@ import json
 import math
 import threading
 import re
+from pathlib import Path
+from io import BytesIO
 
 import fitz  # PyMuPDF
 import requests
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
+from PIL import Image
+import pytesseract
 
 from dotenv import load_dotenv
 import os
 
-load_dotenv()
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(dotenv_path=BASE_DIR / ".env")
 API_KEY = os.getenv("OPENROUTER_API_KEY")
 
 app = FastAPI()
@@ -21,10 +26,18 @@ _EMBEDDING_MODEL = None
 _EMBEDDING_MODEL_LOAD_FAILED = False
 
 
+class RubricCriterion(BaseModel):
+    criterion: str
+    description: str = ""
+    max_marks: float
+    weight: float = 1.0
+
+
 class EvaluateRequest(BaseModel):
     question: str
     student_answer: str
     reference_answer: str
+    evaluation_rubric: list[RubricCriterion] = Field(default_factory=list)
 
 
 class EvaluateResponse(BaseModel):
@@ -57,7 +70,37 @@ class EvaluateMultipleRequest(BaseModel):
 
 class QuestionWiseResult(BaseModel):
     question: str
+    student_answer: str = ""
     marks: float
+    score: float
+    feedback: str
+    correct_points: list[str]
+    wrong_points: list[str]
+    missing_concepts: list[str]
+    strong_topics: list[str]
+    weak_topics: list[str]
+    mistakes: list[str]
+    suggestions: list[str]
+    confidence: float
+    topics: list[str]
+
+
+class EvaluateMultipleResponse(BaseModel):
+    results: list[QuestionWiseResult]
+    total_marks: float
+    overall_feedback: str
+    common_mistakes: list[str]
+    improvement_plan: list[str]
+
+
+class EvaluateFileDetailedResponse(BaseModel):
+    extracted_text: str
+    questions: list[ParsedQuestion]
+    results: list[QuestionWiseResult]
+    total_marks: float
+    overall_feedback: str
+    common_mistakes: list[str]
+    improvement_plan: list[str]
     score: float
     feedback: str
     correct_points: list[str]
@@ -93,12 +136,18 @@ class ExtractPDFTextOnlyResponse(BaseModel):
     extracted_text: str
 
 
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+
 class AnswerWithContextRequest(BaseModel):
     question: str
     contexts: list[str]
     proficiency_level: str | None = None
     weak_topics: list[str] = Field(default_factory=list)
     recent_mistakes: list[str] = Field(default_factory=list)
+    chat_history: list[ChatMessage] = Field(default_factory=list)
 
 
 class AnswerWithContextResponse(BaseModel):
@@ -137,6 +186,149 @@ QUESTION_STOPWORDS = {
     "where", "which", "who", "whom", "whose", "compare", "differentiate",
     "list", "state", "write",
 }
+
+
+def rag_token_sequence(text: str) -> list[str]:
+    tokens = re.findall(r"[a-zA-Z0-9]+", (text or "").lower())
+    return [token for token in tokens if len(token) >= 3 and token not in QUESTION_STOPWORDS]
+
+
+def question_bigrams(question: str) -> list[str]:
+    tokens = rag_token_sequence(question)
+    if len(tokens) < 2:
+        return []
+    seen: set[str] = set()
+    result: list[str] = []
+    for index in range(len(tokens) - 1):
+        bigram = f"{tokens[index]} {tokens[index + 1]}"
+        if bigram in seen:
+            continue
+        seen.add(bigram)
+        result.append(bigram)
+    return result
+
+
+def is_question_grounded_in_contexts(question: str, contexts: list[str]) -> bool:
+    if not (question or "").strip() or not contexts:
+        return False
+
+    question_tokens = set(rag_token_sequence(question))
+    if not question_tokens:
+        return False
+
+    combined_context = " ".join(contexts).lower()
+    context_tokens = set(rag_token_sequence(combined_context))
+    overlap = question_tokens.intersection(context_tokens)
+    if not overlap:
+        return False
+
+    anchors = [token for token in question_tokens if len(token) >= 7]
+    # Keep anchor matching as a soft requirement to avoid false negatives.
+    if anchors and not any(anchor in context_tokens for anchor in anchors) and len(overlap) < 2:
+        return False
+
+    bigrams = question_bigrams(question)
+    if bigrams:
+        matched_bigrams = sum(1 for bigram in bigrams if bigram in combined_context)
+        # For short concept queries (e.g., "linear regression"), require phrase-level match
+        # to avoid drifting to nearby topics sharing only one token.
+        if len(question_tokens) <= 4:
+            return matched_bigrams > 0
+
+    if len(question_tokens) <= 2:
+        return len(overlap) >= 1
+    return len(overlap) >= 2
+
+
+def is_answer_relevant_to_question(question: str, answer: str) -> bool:
+    question_tokens = set(rag_token_sequence(question))
+    answer_tokens = set(rag_token_sequence(answer))
+    if not question_tokens or not answer_tokens:
+        return False
+    overlap = question_tokens.intersection(answer_tokens)
+    if not overlap:
+        return False
+
+    bigrams = question_bigrams(question)
+    answer_lower = (answer or "").lower()
+    if bigrams:
+        matched_bigrams = sum(1 for bigram in bigrams if bigram in answer_lower)
+        if len(question_tokens) <= 4:
+            return matched_bigrams > 0
+
+    if len(question_tokens) <= 2:
+        return len(overlap) >= 1
+    return len(overlap) >= 2
+
+
+def build_extractive_context_answer(question: str, contexts: list[str]) -> AnswerWithContextResponse:
+    def is_explanatory_sentence(text: str) -> bool:
+        lower = f" {(text or '').strip().lower()} "
+        if len(lower.split()) < 6:
+            return False
+        cues = [
+            " is ", " are ", " means ", " refers to ", " uses ", " works ", " predicts ", " classifies ",
+            " estimates ", " where ", " which ", " that ", " because ", " by ",
+        ]
+        return any(cue in lower for cue in cues)
+
+    question_tokens = set(rag_token_sequence(question))
+    candidates: list[tuple[int, str]] = []
+    fragments: list[tuple[int, str]] = []
+
+    for context in contexts:
+        for sentence in re.split(r"[.!?\n;]+", context or ""):
+            text = (sentence or "").strip()
+            if len(text) < 24:
+                continue
+            score = len(question_tokens.intersection(set(rag_token_sequence(text))))
+            if score <= 0:
+                continue
+            if is_explanatory_sentence(text):
+                candidates.append((score, text))
+            else:
+                fragments.append((score, text))
+
+    if candidates:
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        top = [text for _, text in candidates[:2]]
+        return AnswerWithContextResponse(
+            answer=f"Based on the uploaded material: {' '.join(top)}",
+            confidence=0.45,
+            citations=[],
+        )
+
+    if fragments:
+        fragments.sort(key=lambda item: item[0], reverse=True)
+        tags: list[str] = []
+        for _, text in fragments:
+            if len(tags) >= 3:
+                break
+            if len(text) > 80:
+                continue
+            tags.append(text)
+        if tags:
+            return AnswerWithContextResponse(
+                answer=f"I found related topics in the uploaded material ({', '.join(tags)}), but there is not enough explanatory text in the current chunks to give a full definition. Please open the material and share a specific passage for a precise explanation.",
+                confidence=0.35,
+                citations=[],
+            )
+
+    if contexts:
+        snippet = (contexts[0] or "").strip()
+        if len(snippet) > 260:
+            snippet = snippet[:260].strip() + "..."
+        return AnswerWithContextResponse(
+            answer=f"I found related material, but could not generate a detailed response right now. Key snippet: {snippet}",
+            confidence=0.35,
+            citations=[],
+        )
+
+    return AnswerWithContextResponse(
+        answer="I could not find this topic in the uploaded course materials. Please ask a question from course content or ask your professor to upload material for this topic.",
+        confidence=0.2,
+        citations=[],
+    )
 
 
 def extract_question_keywords(text: str) -> list[str]:
@@ -392,6 +584,7 @@ def run_evaluation(payload: EvaluateRequest) -> EvaluateResponse:
     question = clean_text(payload.question)
     student_answer = clean_text(payload.student_answer)
     reference_answer = clean_text(payload.reference_answer)
+    rubric = payload.evaluation_rubric or []
     print("QUESTION:", question)
     print("REFERENCE:", reference_answer[:300])
     print("STUDENT:", student_answer[:300])
@@ -448,7 +641,7 @@ def run_evaluation(payload: EvaluateRequest) -> EvaluateResponse:
     load_dotenv()
     api_key = os.getenv("OPENROUTER_API_KEY")
     if not api_key:
-        raise HTTPException(status_code=500, detail="OPENROUTER_API_KEY is not set")
+        return build_extractive_context_answer(question, [])
 
     system_prompt = """
 You are a strict academic evaluator.
@@ -472,6 +665,9 @@ Answer Key:
 Student Answer:
 {student_answer}
 
+Evaluation Rubric (JSON):
+{json.dumps([item.model_dump() for item in rubric], ensure_ascii=False)}
+
 ---
 
 TASK:
@@ -479,6 +675,7 @@ TASK:
 1. Extract key concepts from answer key
 2. For each concept:
    - Check if student covered it correctly, incorrectly, or missed it
+3. Follow the evaluation rubric strictly when assigning score and feedback.
 
 3. Output STRICT JSON:
 {{
@@ -498,6 +695,7 @@ RULES:
 - If answer is partially correct -> mid score (4-7)
 - If mostly correct -> high score (7-10)
 - If irrelevant -> score < 3
+- Respect rubric max marks and criterion weighting as hard constraints.
 - Concepts must be short technical phrases, not full sentences
 - Return JSON only, no markdown, no code fences, no extra text.
 """.strip()
@@ -793,7 +991,14 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> str:
         with fitz.open(stream=pdf_bytes, filetype="pdf") as pdf_document:
             text_parts = []
             for page in pdf_document:
-                text_parts.append(page.get_text())
+                page_text = (page.get_text() or "").strip()
+                if not page_text:
+                    try:
+                        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+                        page_text = extract_text_from_image(pix.tobytes("png"))
+                    except Exception:
+                        page_text = ""
+                text_parts.append(page_text)
     except Exception as exc:
         raise HTTPException(status_code=400, detail="Unable to read PDF file") from exc
 
@@ -804,12 +1009,31 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> str:
     return extracted_text
 
 
+def extract_text_from_image(image_bytes: bytes) -> str:
+    try:
+        with Image.open(BytesIO(image_bytes)) as image:
+            image = image.convert("RGB")
+            text = pytesseract.image_to_string(image)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Unable to read image file") from exc
+
+    extracted_text = (text or "").strip()
+    if not extracted_text:
+        raise HTTPException(status_code=400, detail="No text found in the uploaded image")
+    return extracted_text
+
+
 def split_into_question_answer_pairs(extracted_text: str) -> list[ParsedQuestion]:
     # Stop parsing before REFERENCES section.
     cleaned_text = re.split(r"(?i)\bREFERENCES\b", extracted_text, maxsplit=1)[0].strip()
+    if not cleaned_text:
+        return []
 
-    # Match question starts like 1.Why / 1. Why / 2.What
-    split_pattern = re.compile(r"\n?\d+\.\s*")
+    # Match markers like:
+    # 1. / 1) / Q1. / Question 1:
+    split_pattern = re.compile(
+        r"(?im)^\s*(?:q(?:uestion)?\s*)?(\d{1,3})\s*[\.\):\-]\s*"
+    )
     matches = list(split_pattern.finditer(cleaned_text))
 
     question_starters = (
@@ -834,12 +1058,15 @@ def split_into_question_answer_pairs(extracted_text: str) -> list[ParsedQuestion
         "write",
     )
 
+    def normalize_inline(value: str) -> str:
+        return re.sub(r"\s+", " ", (value or "").strip())
+
     questions: list[ParsedQuestion] = []
     for index, match in enumerate(matches):
+        q_number = match.group(1)
         start = match.end()
         end = matches[index + 1].start() if index + 1 < len(matches) else len(cleaned_text)
-        block = cleaned_text[start:end]
-        block = block.strip()
+        block = cleaned_text[start:end].strip()
         if not block:
             continue
 
@@ -847,47 +1074,34 @@ def split_into_question_answer_pairs(extracted_text: str) -> list[ParsedQuestion
         if not lines:
             continue
 
-        # Build question from one or more lines.
-        question_parts: list[str] = [re.sub(r"\s+", " ", lines[0]).strip()]
-        line_index = 1
-        while line_index < len(lines):
-            question_so_far = " ".join(question_parts).strip()
-            if question_so_far.endswith("?") or question_so_far.endswith("."):
-                break
-
-            current_line = re.sub(r"\s+", " ", lines[line_index]).strip()
-            if not current_line:
-                line_index += 1
-                continue
-
-            # Continue question if line looks like continuation.
-            if current_line[0].islower() or len(current_line.split()) <= 6:
-                question_parts.append(current_line)
-                line_index += 1
-                continue
-
-            # Otherwise treat as start of answer paragraph.
-            break
-
-        question_line = " ".join(question_parts).strip()
-        question_line = re.sub(r"\s+", " ", question_line).strip()
-        answer_text = re.sub(r"\s+", " ", "\n".join(lines[line_index:])).strip()
-
-        if not question_line or not answer_text:
-            continue
-
-        lower_question = question_line.lower()
+        first_line = normalize_inline(lines[0])
+        lower_first_line = first_line.lower()
         looks_like_question = (
-            "?" in question_line
-            or lower_question.startswith(question_starters)
+            "?" in first_line
+            or lower_first_line.startswith(question_starters)
         )
-        if not looks_like_question:
+
+        # Question + answer format: first line is prompt, rest is response.
+        if looks_like_question and len(lines) > 1:
+            answer_text = normalize_inline("\n".join(lines[1:]))
+            if answer_text:
+                questions.append(
+                    ParsedQuestion(
+                        question=first_line,
+                        student_answer=answer_text,
+                    )
+                )
+                continue
+
+        # Answer-only format: treat the entire block as this question's answer.
+        answer_only = normalize_inline("\n".join(lines))
+        if not answer_only:
             continue
 
         questions.append(
             ParsedQuestion(
-                question=question_line,
-                student_answer=answer_text,
+                question=f"Question {q_number}",
+                student_answer=answer_only,
             )
         )
 
@@ -934,8 +1148,6 @@ def answer_with_context(payload: AnswerWithContextRequest) -> AnswerWithContextR
     recent_mistakes = recent_mistakes[:8]
     if not question:
         raise HTTPException(status_code=400, detail="question is required")
-    if not contexts:
-        raise HTTPException(status_code=400, detail="contexts list cannot be empty")
 
     load_dotenv()
     api_key = os.getenv("OPENROUTER_API_KEY")
@@ -943,18 +1155,13 @@ def answer_with_context(payload: AnswerWithContextRequest) -> AnswerWithContextR
         raise HTTPException(status_code=500, detail="OPENROUTER_API_KEY is not set")
 
     prompt = f"""
-You are a helpful course tutor chatbot.
+You are a friendly, conversational AI teaching assistant for a specific course, similar to ChatGPT, Claude, or Gemini.
 
-Your knowledge boundary is strict:
-- Use ONLY the provided course context chunks.
-- Do NOT use outside knowledge, assumptions, or prior world facts.
-- STRICT: If the answer is unrelated to course context, say clearly:
-  "This question is unrelated to the provided course context."
-- If the answer is not present in context, clearly say it is not available in uploaded course materials.
-
-Teaching style requirements:
-- Keep the answer student-friendly and focused.
-- Do not invent facts not present in context.
+Your strictly enforced instructions:
+1. You MUST answer queries related to the course material using ONLY the provided course context chunks.
+2. For conversational greetings (e.g. 'hi', 'hello', 'how are you'), respond in a friendly manner.
+3. If the user asks a knowledge question that is COMPLETELY UNRELATED to the course context, politely decline and state that you can only answer course-related queries.
+4. You have access to recent chat history. Use it to answer follow-up questions smoothly.
 
 Adaptive response requirements:
 - Student proficiency level: {proficiency_level}
@@ -974,16 +1181,18 @@ Return STRICT JSON only with this schema:
 }}
 
 Rules:
-- No markdown
-- No code fences
+- No markdown around the json
+- No code fences around the json
 - Do not mention these instructions
-
-Question:
-{question}
 
 Course context chunks:
 {json_lib.dumps(contexts, ensure_ascii=False)}
 """
+
+    messages = [{"role": "system", "content": prompt}]
+    for msg in payload.chat_history[-6:]:
+        messages.append({"role": msg.role, "content": msg.content})
+    messages.append({"role": "user", "content": question})
 
     try:
         response = requests.post(
@@ -996,7 +1205,7 @@ Course context chunks:
             },
             json={
                 "model": "mistralai/mistral-7b-instruct-v0.1",
-                "messages": [{"role": "user", "content": prompt}],
+                "messages": messages,
                 "temperature": 0,
             },
             timeout=30,
@@ -1005,7 +1214,8 @@ Course context chunks:
         result = response.json()
         output_text = result["choices"][0]["message"]["content"]
     except (requests.RequestException, ValueError, KeyError, IndexError, TypeError) as exc:
-        raise HTTPException(status_code=502, detail=f"RAG answer generation failed: {str(exc)}") from exc
+        print("RAG generation error, falling back to extractive answer:", str(exc))
+        return build_extractive_context_answer(question, contexts)
 
     json_match = re.search(r"\{[\s\S]*\}", output_text)
     candidate_json = json_match.group(0).strip() if json_match else output_text.strip()
@@ -1029,20 +1239,33 @@ async def evaluate_file(
     file: UploadFile = File(...),
     reference_answer: str = Form(""),
     question: str = Form(""),
+    rubric_json: str = Form("[]"),
 ) -> EvaluateFileDetailedResponse:
-    if not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Please upload a PDF file")
+    file_name = (file.filename or "").lower()
+    supported_exts = (".pdf", ".png", ".jpg", ".jpeg", ".webp")
+    if not file_name.endswith(supported_exts):
+        raise HTTPException(status_code=400, detail="Please upload a PDF or image file")
 
     try:
         file_bytes = await file.read()
     except Exception as exc:
         raise HTTPException(status_code=400, detail="Could not read uploaded file") from exc
 
-    extracted_text = extract_text_from_pdf(file_bytes)
+    if file_name.endswith(".pdf"):
+        extracted_text = extract_text_from_pdf(file_bytes)
+    else:
+        extracted_text = extract_text_from_image(file_bytes)
     print("Extracted text length:", len(extracted_text))
     print("Extracted text:", extracted_text[:500])
 
     question = (question or "").strip()
+    try:
+        parsed_rubric_raw = json.loads((rubric_json or "[]").strip() or "[]")
+        if not isinstance(parsed_rubric_raw, list):
+            parsed_rubric_raw = []
+        parsed_rubric = [RubricCriterion(**item) for item in parsed_rubric_raw if isinstance(item, dict)]
+    except Exception:
+        parsed_rubric = []
     if question:
         print("Single-question mode enabled. Skipping split and evaluate-multiple.")
         single_result = run_evaluation(
@@ -1050,6 +1273,7 @@ async def evaluate_file(
                 question=question,
                 student_answer=extracted_text,
                 reference_answer=reference_answer,
+                evaluation_rubric=parsed_rubric,
             )
         )
         return EvaluateFileDetailedResponse(
@@ -1063,6 +1287,7 @@ async def evaluate_file(
             results=[
                 QuestionWiseResult(
                     question=question,
+                    student_answer=extracted_text,
                     marks=single_result.marks,
                     score=single_result.score,
                     feedback=single_result.feedback,
@@ -1091,6 +1316,7 @@ async def evaluate_file(
                 question="Full submission response",
                 student_answer=extracted_text,
                 reference_answer=reference_answer,
+                evaluation_rubric=parsed_rubric,
             )
         )
         return EvaluateFileDetailedResponse(
@@ -1099,6 +1325,7 @@ async def evaluate_file(
             results=[
                 QuestionWiseResult(
                     question="Full submission response",
+                    student_answer=extracted_text,
                     marks=single_result.marks,
                     score=single_result.score,
                     feedback=single_result.feedback,
@@ -1124,6 +1351,7 @@ async def evaluate_file(
             question=item.question,
             student_answer=item.student_answer,
             reference_answer=reference_answer,
+            evaluation_rubric=parsed_rubric,
         )
         for item in parsed_questions
     ]
@@ -1166,6 +1394,7 @@ def evaluate_multiple(payload: EvaluateMultipleRequest) -> EvaluateMultipleRespo
         results.append(
             QuestionWiseResult(
                 question=question_payload.question,
+                student_answer=question_payload.student_answer,
                 marks=evaluation.marks,
                 score=evaluation.score,
                 feedback=evaluation.feedback,

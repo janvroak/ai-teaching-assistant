@@ -1,0 +1,17 @@
+./adaptive_profile.go
+./ai_service.go
+./analytics.go
+./assignments.go
+./auth.go
+./courses.go
+./db.go
+./evaluations.go
+./jwt.go
+./main.go
+./middleware.go
+./models.go
+./plagiarism.go
+./rag.go
+./submissions.go
+./units.go
+./utils.go

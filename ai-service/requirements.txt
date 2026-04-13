@@ -6,3 +6,5 @@ requests
 PyMuPDF
 python-multipart
 sentence-transformers
+Pillow
+pytesseract

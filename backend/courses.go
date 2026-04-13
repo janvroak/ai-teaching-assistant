@@ -391,6 +391,25 @@ func DeleteCourseHandler(c *gin.Context) {
 		}
 
 		if len(submissionIDs) > 0 {
+			var evaluationIDs []uint
+			if err := tx.Model(&Evaluation{}).
+				Where("submission_id IN ?", submissionIDs).
+				Pluck("id", &evaluationIDs).Error; err != nil {
+				rollbackWithError("Failed to fetch evaluation ids")
+				return
+			}
+
+			if len(evaluationIDs) > 0 {
+				if err := tx.Where("evaluation_id IN ?", evaluationIDs).Delete(&EvaluationQuestion{}).Error; err != nil {
+					rollbackWithError("Failed to delete evaluation questions")
+					return
+				}
+				if err := tx.Where("evaluation_id IN ?", evaluationIDs).Delete(&EvaluationAuditLog{}).Error; err != nil {
+					rollbackWithError("Failed to delete evaluation audit logs")
+					return
+				}
+			}
+
 			if err := tx.Where("submission_id IN ?", submissionIDs).Delete(&Evaluation{}).Error; err != nil {
 				rollbackWithError("Failed to delete evaluations")
 				return

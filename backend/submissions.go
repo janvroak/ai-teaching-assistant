@@ -29,6 +29,7 @@ type AIEvaluateRequest struct {
 	Question        string `json:"question"`
 	StudentAnswer   string `json:"student_answer"`
 	ReferenceAnswer string `json:"reference_answer"`
+	EvaluationRubric []RubricCriterion `json:"evaluation_rubric"`
 }
 
 type AIEvaluateResponse struct {
@@ -46,6 +47,8 @@ type AIEvaluateResponse struct {
 }
 
 type AIEvaluateFileResult struct {
+	Question        string   `json:"question"`
+	StudentAnswer   string   `json:"student_answer"`
 	Marks           float64  `json:"marks"`
 	Score           float64  `json:"score"`
 	Feedback        string   `json:"feedback"`
@@ -65,6 +68,18 @@ type AIEvaluateFileResponse struct {
 	TotalMarks      float64                `json:"total_marks"`
 	OverallFeedback string                 `json:"overall_feedback"`
 	CommonMistakes  []string               `json:"common_mistakes"`
+}
+
+func assignmentRubric(assignment Assignment) []RubricCriterion {
+	trimmed := strings.TrimSpace(assignment.RubricJSON)
+	if trimmed == "" {
+		return []RubricCriterion{}
+	}
+	var rubric []RubricCriterion
+	if err := json.Unmarshal([]byte(trimmed), &rubric); err != nil {
+		return []RubricCriterion{}
+	}
+	return rubric
 }
 
 func normalizedTopics(topics []string) []string {
@@ -133,6 +148,7 @@ type AssignmentSubmissionResponse struct {
 	Content        string `json:"content"`
 	SubmissionType string `json:"submission_type"`
 	SubmissionPDF  string `json:"submission_pdf_url,omitempty"`
+	SubmissionFile string `json:"submission_file_url,omitempty"`
 	Evaluation     gin.H  `json:"evaluation"`
 }
 
@@ -143,6 +159,7 @@ type MySubmissionResponse struct {
 	Content         string `json:"content"`
 	SubmissionType  string `json:"submission_type"`
 	SubmissionPDF   string `json:"submission_pdf_url,omitempty"`
+	SubmissionFile  string `json:"submission_file_url,omitempty"`
 	Evaluation      gin.H  `json:"evaluation"`
 }
 
@@ -241,6 +258,7 @@ func SubmitHandler(c *gin.Context) {
 		Question:        strings.TrimSpace(assignment.Question),
 		StudentAnswer:   req.Content,
 		ReferenceAnswer: assignment.AnswerKey,
+		EvaluationRubric: assignmentRubric(assignment),
 	}
 	if evalReq.Question == "" {
 		evalReq.Question = assignment.Title
@@ -317,20 +335,51 @@ func SubmitHandler(c *gin.Context) {
 				}
 				return append(append([]string{}, evalResp.StrongTopics...), evalResp.WeakTopics...)
 			}()),
-			IsFinal: false,
+			IsFinal:            false,
+			AIOriginalMarks:    evalResp.Marks,
+			AIOriginalFeedback: evalResp.Feedback,
 		}
 		if err := tx.Create(&evaluation).Error; err != nil {
 			return err
 		}
 
-		return updateAdaptiveProfileOnEvaluation(
+		questionText := strings.TrimSpace(evalReq.Question)
+		if questionText == "" {
+			questionText = "Question 1"
+		}
+		questionRow := EvaluationQuestion{
+			EvaluationID:       evaluation.ID,
+			QuestionText:       questionText,
+			StudentAnswerText:  strings.TrimSpace(req.Content),
+			Marks:              evalResp.Marks,
+			Feedback:           evalResp.Feedback,
+			Confidence:         evalResp.Confidence,
+			CorrectPoints:      normalizeStringList(evalResp.CorrectPoints, 40),
+			WrongPoints:        normalizeStringList(evalResp.WrongPoints, 40),
+			MissingConcepts:    normalizeStringList(evalResp.MissingConcepts, 40),
+			StrongTopics:       normalizeStringList(evalResp.StrongTopics, 20),
+			WeakTopics:         normalizeStringList(evalResp.WeakTopics, 20),
+			Mistakes:           normalizeStringList(evalResp.Mistakes, 40),
+			Topics:             normalizedTopics(evalResp.Topics),
+			AIOriginalMarks:    evalResp.Marks,
+			AIOriginalFeedback: evalResp.Feedback,
+		}
+		if err := tx.Create(&questionRow).Error; err != nil {
+			return err
+		}
+
+		if err := updateAdaptiveProfileOnEvaluation(
 			tx,
 			studentID,
 			assignment.CourseID,
 			evaluation.Marks,
 			evalReq.Question,
 			evaluation.Mistakes,
-		)
+		); err != nil {
+			return err
+		}
+
+		return evaluateSubmissionIntegrity(tx, submission, assignment)
 	}); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"error": "Failed to save submission evaluation",
@@ -350,6 +399,7 @@ func SubmitHandler(c *gin.Context) {
 		"weak_topics":      evaluation.WeakTopics,
 		"mistakes":         evaluation.Mistakes,
 		"topics":           evaluation.Topics,
+		"is_final":         evaluation.IsFinal,
 	})
 }
 
@@ -402,9 +452,9 @@ func SubmitFileHandler(c *gin.Context) {
 		})
 		return
 	}
-	if strings.ToLower(filepath.Ext(fileHeader.Filename)) != ".pdf" {
+	if !isSupportedSubmissionExtension(fileHeader.Filename) {
 		c.JSON(http.StatusBadRequest, gin.H{
-			"error": "Only PDF files are supported",
+			"error": "Supported file formats: PDF, PNG, JPG, JPEG, WEBP",
 		})
 		return
 	}
@@ -469,10 +519,10 @@ func SubmitFileHandler(c *gin.Context) {
 		return
 	}
 
-	savedFilePath, err := saveSubmissionPDFFile(fileHeader, fileBytes)
+	savedFilePath, err := saveSubmissionFile(fileHeader, fileBytes)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": fmt.Sprintf("Failed to store uploaded submission PDF: %v", err),
+			"error": fmt.Sprintf("Failed to store uploaded submission file: %v", err),
 		})
 		return
 	}
@@ -500,23 +550,21 @@ func SubmitFileHandler(c *gin.Context) {
 		})
 		return
 	}
-	questionText := strings.TrimSpace(assignment.Question)
-	if questionText == "" {
-		questionText = strings.TrimSpace(assignment.Title)
-	}
 	if err := multipartWriter.WriteField("reference_answer", referenceAnswer); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"error": "Failed to prepare file upload payload",
 		})
 		return
 	}
-	if questionText != "" {
-		if err := multipartWriter.WriteField("question", questionText); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{
-				"error": "Failed to prepare file upload payload",
-			})
-			return
-		}
+	rubricJSON := strings.TrimSpace(assignment.RubricJSON)
+	if rubricJSON == "" {
+		rubricJSON = "[]"
+	}
+	if err := multipartWriter.WriteField("rubric_json", rubricJSON); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Failed to prepare file upload payload",
+		})
+		return
 	}
 	if err := multipartWriter.Close(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
@@ -586,7 +634,7 @@ func SubmitFileHandler(c *gin.Context) {
 
 	feedback := strings.TrimSpace(evalResp.OverallFeedback)
 	if feedback == "" {
-		feedback = "Evaluation completed from uploaded PDF."
+		feedback = "Evaluation completed from uploaded submission file."
 	}
 
 	evaluation := Evaluation{}
@@ -622,20 +670,60 @@ func SubmitFileHandler(c *gin.Context) {
 					collectWeakTopicsFromFileResults(evalResp.Results)...,
 				)
 			}()),
-			IsFinal: false,
+			IsFinal:            false,
+			AIOriginalMarks:    evalResp.TotalMarks,
+			AIOriginalFeedback: feedback,
 		}
 		if err := tx.Create(&evaluation).Error; err != nil {
 			return err
 		}
 
-		return updateAdaptiveProfileOnEvaluation(
+		for index, result := range evalResp.Results {
+			questionText := strings.TrimSpace(result.Question)
+			if questionText == "" {
+				questionText = fmt.Sprintf("Question %d", index+1)
+			}
+			questionRow := EvaluationQuestion{
+				EvaluationID:       evaluation.ID,
+				QuestionText:       questionText,
+				StudentAnswerText:  strings.TrimSpace(result.StudentAnswer),
+				Marks:              result.Marks,
+				Feedback:           strings.TrimSpace(result.Feedback),
+				Confidence:         result.Confidence,
+				CorrectPoints:      normalizeStringList(result.CorrectPoints, 40),
+				WrongPoints:        normalizeStringList(result.WrongPoints, 40),
+				MissingConcepts:    normalizeStringList(result.MissingConcepts, 40),
+				StrongTopics:       normalizeStringList(result.StrongTopics, 20),
+				WeakTopics:         normalizeStringList(result.WeakTopics, 20),
+				Mistakes:           normalizeStringList(result.Mistakes, 40),
+				Topics:             normalizedTopics(result.Topics),
+				AIOriginalMarks:    result.Marks,
+				AIOriginalFeedback: strings.TrimSpace(result.Feedback),
+			}
+			if questionRow.Feedback == "" {
+				questionRow.Feedback = "No detailed feedback provided."
+			}
+			if err := tx.Create(&questionRow).Error; err != nil {
+				return err
+			}
+		}
+
+		adaptiveQuestion := strings.TrimSpace(assignment.Question)
+		if adaptiveQuestion == "" {
+			adaptiveQuestion = assignment.Title
+		}
+		if err := updateAdaptiveProfileOnEvaluation(
 			tx,
 			studentID,
 			assignment.CourseID,
 			evaluation.Marks,
-			questionText,
+			adaptiveQuestion,
 			evaluation.Mistakes,
-		)
+		); err != nil {
+			return err
+		}
+
+		return evaluateSubmissionIntegrity(tx, submission, assignment)
 	}); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"error": "Failed to save submission evaluation",
@@ -643,18 +731,27 @@ func SubmitFileHandler(c *gin.Context) {
 		return
 	}
 
+	responseSubmission := Submission{
+		ID:       evaluation.SubmissionID,
+		FilePath: savedFilePath,
+	}
+
 	c.JSON(http.StatusCreated, gin.H{
-		"marks":            evaluation.Marks,
-		"score":            evaluation.Marks,
-		"feedback":         evaluation.Feedback,
-		"confidence":       evaluation.Confidence,
-		"correct_points":   evaluation.CorrectPoints,
-		"wrong_points":     evaluation.WrongPoints,
-		"missing_concepts": evaluation.MissingConcepts,
-		"strong_topics":    evaluation.StrongTopics,
-		"weak_topics":      evaluation.WeakTopics,
-		"mistakes":         evaluation.Mistakes,
-		"topics":           evaluation.Topics,
+		"submission_id":       evaluation.SubmissionID,
+		"marks":               evaluation.Marks,
+		"score":               evaluation.Marks,
+		"feedback":            evaluation.Feedback,
+		"confidence":          evaluation.Confidence,
+		"correct_points":      evaluation.CorrectPoints,
+		"wrong_points":        evaluation.WrongPoints,
+		"missing_concepts":    evaluation.MissingConcepts,
+		"strong_topics":       evaluation.StrongTopics,
+		"weak_topics":         evaluation.WeakTopics,
+		"mistakes":            evaluation.Mistakes,
+		"topics":              evaluation.Topics,
+		"submission_pdf_url":  submissionPDFURL(responseSubmission),
+		"submission_file_url": submissionFileURL(responseSubmission),
+		"is_final":            evaluation.IsFinal,
 	})
 }
 
@@ -743,28 +840,11 @@ func GetSubmissionsHandler(c *gin.Context) {
 	}
 
 	submissionIDs := make([]uint, 0, len(submissions))
-	assignmentIDs := make([]uint, 0, len(submissions))
 	for _, submission := range submissions {
 		submissionIDs = append(submissionIDs, submission.ID)
-		assignmentIDs = append(assignmentIDs, submission.AssignmentID)
 	}
 
 	evaluationBySubmissionID := make(map[uint]Evaluation, len(submissionIDs))
-	assignmentTitleByID := make(map[uint]string, len(assignmentIDs))
-
-	if len(assignmentIDs) > 0 {
-		var assignments []Assignment
-		if err := DB.Model(&Assignment{}).Where("id IN ?", assignmentIDs).Select("id", "title").Find(&assignments).Error; err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{
-				"error": "Failed to fetch assignment data",
-			})
-			return
-		}
-
-		for _, assignment := range assignments {
-			assignmentTitleByID[assignment.ID] = assignment.Title
-		}
-	}
 
 	if len(submissionIDs) > 0 {
 		var evaluations []Evaluation
@@ -786,21 +866,61 @@ func GetSubmissionsHandler(c *gin.Context) {
 		}
 	}
 
+	evaluationQuestionsByEvaluationID := make(map[uint][]EvaluationQuestion)
+	if len(evaluationBySubmissionID) > 0 {
+		evaluationIDs := make([]uint, 0, len(evaluationBySubmissionID))
+		for _, evaluation := range evaluationBySubmissionID {
+			evaluationIDs = append(evaluationIDs, evaluation.ID)
+		}
+		var questionRows []EvaluationQuestion
+		if err := DB.Where("evaluation_id IN ?", evaluationIDs).Order("id ASC").Find(&questionRows).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"error": "Failed to fetch question-wise evaluation data",
+			})
+			return
+		}
+		for _, row := range questionRows {
+			evaluationQuestionsByEvaluationID[row.EvaluationID] = append(evaluationQuestionsByEvaluationID[row.EvaluationID], row)
+		}
+	}
+
+	plagiarismBySubmissionID := make(map[uint]PlagiarismReport, len(submissionIDs))
+	if len(submissionIDs) > 0 {
+		var reports []PlagiarismReport
+		if err := DB.Where("submission_id IN ?", submissionIDs).Order("id DESC").Find(&reports).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"error": "Failed to fetch plagiarism reports",
+			})
+			return
+		}
+		for _, row := range reports {
+			if _, exists := plagiarismBySubmissionID[row.SubmissionID]; !exists {
+				plagiarismBySubmissionID[row.SubmissionID] = row
+			}
+		}
+	}
+
 	response := make([]AssignmentSubmissionResponse, 0, len(submissions))
 	for _, submission := range submissions {
 		evaluationData := gin.H{
-			"id":               nil,
-			"marks":            nil,
-			"score":            nil,
-			"feedback":         nil,
-			"confidence":       nil,
-			"correct_points":   []string{},
-			"wrong_points":     []string{},
-			"missing_concepts": []string{},
-			"strong_topics":    []string{},
-			"weak_topics":      []string{},
-			"mistakes":         []string{},
-			"topics":           []string{},
+			"id":                   nil,
+			"marks":                nil,
+			"score":                nil,
+			"feedback":             nil,
+			"confidence":           nil,
+			"is_final":             false,
+			"ai_original_marks":    nil,
+			"ai_original_feedback": nil,
+			"question_results":     []EvaluationQuestion{},
+			"reference_answer":     assignment.AnswerKey,
+			"correct_points":       []string{},
+			"wrong_points":         []string{},
+			"missing_concepts":     []string{},
+			"strong_topics":        []string{},
+			"weak_topics":          []string{},
+			"mistakes":             []string{},
+			"topics":               []string{},
+			"plagiarism":           nil,
 		}
 		if evaluation, exists := evaluationBySubmissionID[submission.ID]; exists {
 			evaluationData["id"] = evaluation.ID
@@ -815,6 +935,24 @@ func GetSubmissionsHandler(c *gin.Context) {
 			evaluationData["weak_topics"] = evaluation.WeakTopics
 			evaluationData["mistakes"] = evaluation.Mistakes
 			evaluationData["topics"] = evaluation.Topics
+			evaluationData["is_final"] = evaluation.IsFinal
+			evaluationData["ai_original_marks"] = evaluation.AIOriginalMarks
+			evaluationData["ai_original_feedback"] = evaluation.AIOriginalFeedback
+			evaluationData["question_results"] = evaluationQuestionsByEvaluationID[evaluation.ID]
+			evaluationData["reference_answer"] = assignment.AnswerKey
+		}
+		if report, exists := plagiarismBySubmissionID[submission.ID]; exists {
+			evaluationData["plagiarism"] = gin.H{
+				"id":                   report.ID,
+				"flagged":              report.Flagged,
+				"semantic_similarity":  report.SemanticSimilarity,
+				"style_anomaly_score":  report.StyleAnomalyScore,
+				"ai_usage_likelihood":  report.AIUsageLikelihood,
+				"plagiarism_likelihood": report.PlagiarismLikelihood,
+				"interpretation_band":  interpretationBand(report.PlagiarismLikelihood),
+				"reason_summary":       report.ReasonSummary,
+				"reasons":              report.Reasons,
+			}
 		}
 
 		response = append(response, AssignmentSubmissionResponse{
@@ -823,6 +961,7 @@ func GetSubmissionsHandler(c *gin.Context) {
 			Content:        submission.Content,
 			SubmissionType: submissionType(submission),
 			SubmissionPDF:  submissionPDFURL(submission),
+			SubmissionFile: submissionFileURL(submission),
 			Evaluation:     evaluationData,
 		})
 	}
@@ -941,28 +1080,130 @@ func GetSubmissionHandler(c *gin.Context) {
 		return
 	}
 
+	var assignment Assignment
+	if err := DB.Where("id = ?", submission.AssignmentID).First(&assignment).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Failed to fetch assignment details",
+		})
+		return
+	}
+
+	var questionRows []EvaluationQuestion
+	if err := DB.Where("evaluation_id = ?", evaluation.ID).Order("id ASC").Find(&questionRows).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Failed to fetch question-wise evaluation data",
+		})
+		return
+	}
+
+	isStudentViewer := role == "student"
+	visibleToStudent := evaluation.IsFinal
+
 	c.JSON(http.StatusOK, gin.H{
 		"submission": gin.H{
-			"id":              submission.ID,
-			"student_id":      submission.StudentID,
-			"assignment_id":   submission.AssignmentID,
-			"content":         submission.Content,
-			"submission_type": submissionType(submission),
-			"submission_pdf":  submissionPDFURL(submission),
-			"created_at":      submission.CreatedAt,
+			"id":                  submission.ID,
+			"student_id":          submission.StudentID,
+			"assignment_id":       submission.AssignmentID,
+			"content":             submission.Content,
+			"submission_type":     submissionType(submission),
+			"submission_pdf":      submissionPDFURL(submission),
+			"submission_pdf_url":  submissionPDFURL(submission),
+			"submission_file":     submissionFileURL(submission),
+			"submission_file_url": submissionFileURL(submission),
+			"created_at":          submission.CreatedAt,
 		},
 		"evaluation": gin.H{
-			"marks":            evaluation.Marks,
-			"score":            evaluation.Marks,
-			"feedback":         evaluation.Feedback,
-			"confidence":       evaluation.Confidence,
-			"correct_points":   evaluation.CorrectPoints,
-			"wrong_points":     evaluation.WrongPoints,
-			"missing_concepts": evaluation.MissingConcepts,
-			"strong_topics":    evaluation.StrongTopics,
-			"weak_topics":      evaluation.WeakTopics,
-			"mistakes":         evaluation.Mistakes,
-			"topics":           evaluation.Topics,
+			"marks": func() interface{} {
+				if isStudentViewer && !visibleToStudent {
+					return nil
+				}
+				return evaluation.Marks
+			}(),
+			"score": func() interface{} {
+				if isStudentViewer && !visibleToStudent {
+					return nil
+				}
+				return evaluation.Marks
+			}(),
+			"feedback": func() interface{} {
+				if isStudentViewer && !visibleToStudent {
+					return nil
+				}
+				return evaluation.Feedback
+			}(),
+			"confidence": func() interface{} {
+				if isStudentViewer && !visibleToStudent {
+					return nil
+				}
+				return evaluation.Confidence
+			}(),
+			"correct_points": func() []string {
+				if isStudentViewer && !visibleToStudent {
+					return []string{}
+				}
+				return evaluation.CorrectPoints
+			}(),
+			"wrong_points": func() []string {
+				if isStudentViewer && !visibleToStudent {
+					return []string{}
+				}
+				return evaluation.WrongPoints
+			}(),
+			"missing_concepts": func() []string {
+				if isStudentViewer && !visibleToStudent {
+					return []string{}
+				}
+				return evaluation.MissingConcepts
+			}(),
+			"strong_topics": func() []string {
+				if isStudentViewer && !visibleToStudent {
+					return []string{}
+				}
+				return evaluation.StrongTopics
+			}(),
+			"weak_topics": func() []string {
+				if isStudentViewer && !visibleToStudent {
+					return []string{}
+				}
+				return evaluation.WeakTopics
+			}(),
+			"mistakes": func() []string {
+				if isStudentViewer && !visibleToStudent {
+					return []string{}
+				}
+				return evaluation.Mistakes
+			}(),
+			"topics": func() []string {
+				if isStudentViewer && !visibleToStudent {
+					return []string{}
+				}
+				return evaluation.Topics
+			}(),
+			"is_final": evaluation.IsFinal,
+			"question_results": func() []EvaluationQuestion {
+				if isStudentViewer && !visibleToStudent {
+					return []EvaluationQuestion{}
+				}
+				return questionRows
+			}(),
+			"reference_answer": func() string {
+				if isStudentViewer && !visibleToStudent {
+					return ""
+				}
+				return assignment.AnswerKey
+			}(),
+			"ai_original_marks": func() interface{} {
+				if isStudentViewer {
+					return nil
+				}
+				return evaluation.AIOriginalMarks
+			}(),
+			"ai_original_feedback": func() interface{} {
+				if isStudentViewer {
+					return nil
+				}
+				return evaluation.AIOriginalFeedback
+			}(),
 		},
 	})
 }
@@ -1016,10 +1257,11 @@ func GetMySubmissionsHandler(c *gin.Context) {
 
 	evaluationBySubmissionID := make(map[uint]Evaluation, len(submissionIDs))
 	assignmentTitleByID := make(map[uint]string, len(assignmentIDs))
+	assignmentByID := make(map[uint]Assignment, len(assignmentIDs))
 
 	if len(assignmentIDs) > 0 {
 		var assignments []Assignment
-		if err := DB.Model(&Assignment{}).Where("id IN ?", assignmentIDs).Select("id", "title").Find(&assignments).Error; err != nil {
+		if err := DB.Model(&Assignment{}).Where("id IN ?", assignmentIDs).Find(&assignments).Error; err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{
 				"error": "Failed to fetch assignment data",
 			})
@@ -1028,6 +1270,7 @@ func GetMySubmissionsHandler(c *gin.Context) {
 
 		for _, assignment := range assignments {
 			assignmentTitleByID[assignment.ID] = assignment.Title
+			assignmentByID[assignment.ID] = assignment
 		}
 	}
 
@@ -1047,6 +1290,24 @@ func GetMySubmissionsHandler(c *gin.Context) {
 		}
 	}
 
+	evaluationQuestionsByEvaluationID := make(map[uint][]EvaluationQuestion)
+	if len(evaluationBySubmissionID) > 0 {
+		evaluationIDs := make([]uint, 0, len(evaluationBySubmissionID))
+		for _, evaluation := range evaluationBySubmissionID {
+			evaluationIDs = append(evaluationIDs, evaluation.ID)
+		}
+		var questionRows []EvaluationQuestion
+		if err := DB.Where("evaluation_id IN ?", evaluationIDs).Order("id ASC").Find(&questionRows).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"error": "Failed to fetch question-wise evaluation data",
+			})
+			return
+		}
+		for _, row := range questionRows {
+			evaluationQuestionsByEvaluationID[row.EvaluationID] = append(evaluationQuestionsByEvaluationID[row.EvaluationID], row)
+		}
+	}
+
 	response := make([]MySubmissionResponse, 0, len(submissions))
 	for _, submission := range submissions {
 		evaluationData := gin.H{
@@ -1054,6 +1315,9 @@ func GetMySubmissionsHandler(c *gin.Context) {
 			"score":            nil,
 			"feedback":         nil,
 			"confidence":       nil,
+			"is_final":         false,
+			"question_results": []EvaluationQuestion{},
+			"reference_answer": "",
 			"correct_points":   []string{},
 			"wrong_points":     []string{},
 			"missing_concepts": []string{},
@@ -1064,17 +1328,24 @@ func GetMySubmissionsHandler(c *gin.Context) {
 		}
 
 		if evaluation, exists := evaluationBySubmissionID[submission.ID]; exists {
-			evaluationData["marks"] = evaluation.Marks
-			evaluationData["score"] = evaluation.Marks
-			evaluationData["feedback"] = evaluation.Feedback
-			evaluationData["confidence"] = evaluation.Confidence
-			evaluationData["correct_points"] = evaluation.CorrectPoints
-			evaluationData["wrong_points"] = evaluation.WrongPoints
-			evaluationData["missing_concepts"] = evaluation.MissingConcepts
-			evaluationData["strong_topics"] = evaluation.StrongTopics
-			evaluationData["weak_topics"] = evaluation.WeakTopics
-			evaluationData["mistakes"] = evaluation.Mistakes
-			evaluationData["topics"] = evaluation.Topics
+			evaluationData["is_final"] = evaluation.IsFinal
+			if evaluation.IsFinal {
+				evaluationData["marks"] = evaluation.Marks
+				evaluationData["score"] = evaluation.Marks
+				evaluationData["feedback"] = evaluation.Feedback
+				evaluationData["confidence"] = evaluation.Confidence
+				evaluationData["correct_points"] = evaluation.CorrectPoints
+				evaluationData["wrong_points"] = evaluation.WrongPoints
+				evaluationData["missing_concepts"] = evaluation.MissingConcepts
+				evaluationData["strong_topics"] = evaluation.StrongTopics
+				evaluationData["weak_topics"] = evaluation.WeakTopics
+				evaluationData["mistakes"] = evaluation.Mistakes
+				evaluationData["topics"] = evaluation.Topics
+				evaluationData["question_results"] = evaluationQuestionsByEvaluationID[evaluation.ID]
+				if assignment, ok := assignmentByID[submission.AssignmentID]; ok {
+					evaluationData["reference_answer"] = assignment.AnswerKey
+				}
+			}
 		}
 
 		response = append(response, MySubmissionResponse{
@@ -1084,6 +1355,7 @@ func GetMySubmissionsHandler(c *gin.Context) {
 			Content:         submission.Content,
 			SubmissionType:  submissionType(submission),
 			SubmissionPDF:   submissionPDFURL(submission),
+			SubmissionFile:  submissionFileURL(submission),
 			Evaluation:      evaluationData,
 		})
 	}
@@ -1099,7 +1371,7 @@ func GetSubmissionFileHandler(c *gin.Context) {
 
 	if strings.TrimSpace(submission.FilePath) == "" {
 		c.JSON(http.StatusNotFound, gin.H{
-			"error": "Submission PDF not found",
+			"error": "Submission file not found",
 		})
 		return
 	}
@@ -1206,13 +1478,25 @@ func getAccessibleSubmission(c *gin.Context) (Submission, error) {
 }
 
 func submissionType(submission Submission) string {
-	if strings.TrimSpace(submission.FilePath) != "" {
-		return "pdf"
+	filePath := strings.TrimSpace(submission.FilePath)
+	if filePath != "" {
+		ext := strings.ToLower(filepath.Ext(filePath))
+		if ext == ".pdf" {
+			return "pdf"
+		}
+		return "image"
 	}
 	return "text"
 }
 
 func submissionPDFURL(submission Submission) string {
+	if submissionType(submission) != "pdf" {
+		return ""
+	}
+	return fmt.Sprintf("/submissions/%d/file", submission.ID)
+}
+
+func submissionFileURL(submission Submission) string {
 	if strings.TrimSpace(submission.FilePath) == "" {
 		return ""
 	}
@@ -1245,4 +1529,17 @@ func saveSubmissionPDFFile(fileHeader *multipart.FileHeader, fileBytes []byte) (
 	}
 
 	return filepath.ToSlash(fullPath), nil
+}
+
+func saveSubmissionFile(fileHeader *multipart.FileHeader, fileBytes []byte) (string, error) {
+	return saveSubmissionPDFFile(fileHeader, fileBytes)
+}
+
+func isSupportedSubmissionExtension(filename string) bool {
+	switch strings.ToLower(filepath.Ext(filename)) {
+	case ".pdf", ".png", ".jpg", ".jpeg", ".webp":
+		return true
+	default:
+		return false
+	}
 }

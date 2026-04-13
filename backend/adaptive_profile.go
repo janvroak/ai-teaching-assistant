@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"math"
 	"sort"
 	"strings"
 	"time"
@@ -306,8 +307,8 @@ func buildTopicSnapshots(tx *gorm.DB, studentID uint, courseID uint) (string, st
 		}
 	}
 
-	weakTopics := topTopicsByFrequency(weakScores, 5, 2)
-	strongTopics := topTopicsByFrequency(strongScores, 5, 2)
+	weakTopics := topTopicsByFrequency(weakScores, 5, 1)
+	strongTopics := topTopicsByFrequency(strongScores, 5, 1)
 
 	weakJSON, err := json.Marshal(weakTopics)
 	if err != nil {
@@ -650,25 +651,189 @@ func computeProgress(totalSubmissions int, totalAssignments int) float64 {
 	return progress
 }
 
-func progressLabel(progress float64) string {
-	switch {
-	case progress < 40:
-		return "Beginner"
-	case progress <= 70:
-		return "Improving"
-	default:
-		return "Mastered"
-	}
+type unitProgressComputation struct {
+	UnitID         uint
+	Performance    float64
+	Source         string
+	IsEstimated    bool
+	SignalSummary  string
+	Weight         float64
 }
 
-func courseProgressForStudent(studentID uint, courseID uint, totalSubmissions int) (float64, string, int, error) {
-	_ = studentID
+func estimateSignalPerformance(studentID uint, courseID uint) (float64, string, error) {
+	var interactionCount int64
+	if err := DB.Model(&StudentInteraction{}).
+		Where("student_id = ? AND course_id = ?", studentID, courseID).
+		Count(&interactionCount).Error; err != nil {
+		return 0, "", err
+	}
+
+	var materialRows []MaterialEngagement
+	if err := DB.Where("student_id = ? AND course_id = ?", studentID, courseID).Find(&materialRows).Error; err != nil {
+		return 0, "", err
+	}
+	materialTouches := 0
+	for _, row := range materialRows {
+		materialTouches += row.AccessCount
+	}
+
+	score := (float64(interactionCount) * 9.0) + (float64(materialTouches) * 4.0)
+	score = math.Max(0, math.Min(100, score))
+	summary := "estimated from interaction and engagement signals"
+	if interactionCount == 0 && materialTouches == 0 {
+		summary = "no interaction/engagement signals detected"
+	}
+	return score, summary, nil
+}
+
+func upsertStudentUnitProgress(studentID uint, courseID uint, unit unitProgressComputation) error {
+	now := time.Now()
+	var row StudentUnitProgress
+	err := DB.Where("student_id = ? AND course_id = ? AND unit_id = ?", studentID, courseID, unit.UnitID).First(&row).Error
+	if err != nil {
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return err
+		}
+		row = StudentUnitProgress{
+			StudentID:       studentID,
+			CourseID:        courseID,
+			UnitID:          unit.UnitID,
+			Performance:     unit.Performance,
+			Source:          unit.Source,
+			IsEstimated:     unit.IsEstimated,
+			SignalSummary:   unit.SignalSummary,
+			LastEvaluatedAt: now,
+		}
+		return DB.Create(&row).Error
+	}
+
+	row.Performance = unit.Performance
+	row.Source = unit.Source
+	row.IsEstimated = unit.IsEstimated
+	row.SignalSummary = unit.SignalSummary
+	row.LastEvaluatedAt = now
+	return DB.Save(&row).Error
+}
+
+func progressStatus(progress float64, hasAssignmentEvidence bool, hasAnySignal bool) string {
+	if !hasAnySignal || progress <= 0.01 {
+		return "Not Started"
+	}
+	if hasAssignmentEvidence {
+		if progress >= 75 {
+			return "Mastered"
+		}
+		return "Evaluated"
+	}
+	return "In Progress"
+}
+
+func courseProgressForStudent(studentID uint, courseID uint, totalSubmissions int) (float64, string, int, bool, string, error) {
 	totalAssignments, err := countCourseAssignments(courseID)
 	if err != nil {
-		return 0, "", 0, err
+		return 0, "", 0, false, "", err
 	}
-	progress := computeProgress(totalSubmissions, totalAssignments)
-	return progress, progressLabel(progress), totalAssignments, nil
+
+	var units []CourseUnit
+	if err := DB.Where("course_id = ?", courseID).Order("unit_order ASC, id ASC").Find(&units).Error; err != nil {
+		return 0, "", 0, false, "", err
+	}
+
+	// Backward-compatible fallback when no unit plan exists.
+	if len(units) == 0 {
+		progress := computeProgress(totalSubmissions, totalAssignments)
+		status := progressStatus(progress, totalSubmissions > 0, totalSubmissions > 0)
+		return progress, status, totalAssignments, false, "", nil
+	}
+
+	unitProgresses := make([]unitProgressComputation, 0, len(units))
+	hasAssignmentEvidence := false
+	hasAnySignal := false
+
+	for _, unit := range units {
+		weight := unit.Weight
+		if weight <= 0 {
+			weight = 1
+		}
+
+		var assignmentCount int64
+		if err := DB.Model(&Assignment{}).Where("course_id = ? AND unit_id = ?", courseID, unit.ID).Count(&assignmentCount).Error; err != nil {
+			return 0, "", 0, false, "", err
+		}
+
+		if assignmentCount > 0 {
+			type avgRow struct {
+				AvgMarks float64
+			}
+			var row avgRow
+			if err := DB.Table("evaluations AS e").
+				Select("COALESCE(AVG(e.marks), 0) AS avg_marks").
+				Joins("JOIN submissions AS s ON s.id = e.submission_id").
+				Joins("JOIN assignments AS a ON a.id = s.assignment_id").
+				Where("s.student_id = ? AND a.course_id = ? AND a.unit_id = ?", studentID, courseID, unit.ID).
+				Scan(&row).Error; err != nil {
+				return 0, "", 0, false, "", err
+			}
+			performance := math.Max(0, math.Min(100, row.AvgMarks*10.0))
+			if performance > 0 {
+				hasAnySignal = true
+				hasAssignmentEvidence = true
+			}
+			unitProgress := unitProgressComputation{
+				UnitID:        unit.ID,
+				Performance:   performance,
+				Source:        "assignment",
+				IsEstimated:   false,
+				SignalSummary: "assignment-based evaluation",
+				Weight:        weight,
+			}
+			unitProgresses = append(unitProgresses, unitProgress)
+			if err := upsertStudentUnitProgress(studentID, courseID, unitProgress); err != nil {
+				return 0, "", 0, false, "", err
+			}
+			continue
+		}
+
+		estimatedPerformance, summary, estimateErr := estimateSignalPerformance(studentID, courseID)
+		if estimateErr != nil {
+			return 0, "", 0, false, "", estimateErr
+		}
+		if estimatedPerformance > 0 {
+			hasAnySignal = true
+		}
+		unitProgress := unitProgressComputation{
+			UnitID:        unit.ID,
+			Performance:   estimatedPerformance,
+			Source:        "inferred",
+			IsEstimated:   true,
+			SignalSummary: summary,
+			Weight:        weight,
+		}
+		unitProgresses = append(unitProgresses, unitProgress)
+		if err := upsertStudentUnitProgress(studentID, courseID, unitProgress); err != nil {
+			return 0, "", 0, false, "", err
+		}
+	}
+
+	totalWeight := 0.0
+	weightedSum := 0.0
+	for _, row := range unitProgresses {
+		totalWeight += row.Weight
+		weightedSum += row.Weight * row.Performance
+	}
+	progress := 0.0
+	if totalWeight > 0 {
+		progress = weightedSum / totalWeight
+	}
+	progress = math.Max(0, math.Min(100, progress))
+
+	estimated := !hasAssignmentEvidence && hasAnySignal
+	note := ""
+	if estimated {
+		note = "Progress estimated based on interaction and engagement due to absence of assignment-based evaluation."
+	}
+
+	return progress, progressStatus(progress, hasAssignmentEvidence, hasAnySignal), totalAssignments, estimated, note, nil
 }
 
 func learningTrend(studentID uint, courseID uint) (string, error) {

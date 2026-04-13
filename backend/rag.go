@@ -44,11 +44,17 @@ type AskDoubtRequest struct {
 }
 
 type RAGAnswerRequest struct {
-	Question         string   `json:"question"`
-	Contexts         []string `json:"contexts"`
-	ProficiencyLevel string   `json:"proficiency_level,omitempty"`
-	WeakTopics       []string `json:"weak_topics,omitempty"`
-	RecentMistakes   []string `json:"recent_mistakes,omitempty"`
+	Question         string               `json:"question"`
+	Contexts         []string             `json:"contexts"`
+	ProficiencyLevel string               `json:"proficiency_level,omitempty"`
+	WeakTopics       []string             `json:"weak_topics,omitempty"`
+	RecentMistakes   []string             `json:"recent_mistakes,omitempty"`
+	ChatHistory      []ChatHistoryMessage `json:"chat_history,omitempty"`
+}
+
+type ChatHistoryMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
 }
 
 type RAGAnswerResponse struct {
@@ -276,17 +282,7 @@ func AskCourseDoubtHandler(c *gin.Context) {
 		return scored[i].Score > scored[j].Score
 	})
 
-	// Strictly context-grounded mode:
-	// if no chunk has lexical overlap with the student question,
-	// do not ask the model to avoid out-of-context hallucinations.
-	if len(scored) == 0 || scored[0].Score <= 0 {
-		c.JSON(http.StatusOK, RAGAnswerResponse{
-			Answer:     "I could not find this topic in the uploaded course materials. Please ask a question from course content or ask your professor to upload material for this topic.",
-			Confidence: 0.2,
-			Citations:  []string{},
-		})
-		return
-	}
+
 
 	topN := 6
 	if len(scored) < topN {
@@ -341,7 +337,7 @@ func AskCourseDoubtHandler(c *gin.Context) {
 		}
 		trend = value
 
-		completion, completionLabel, assignmentCount, err := courseProgressForStudent(userID, courseID, totalSubmissions)
+		completion, completionLabel, assignmentCount, _, _, err := courseProgressForStudent(userID, courseID, totalSubmissions)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to calculate course progress"})
 			return
@@ -351,7 +347,18 @@ func AskCourseDoubtHandler(c *gin.Context) {
 		totalAssignments = assignmentCount
 	}
 
-	answer, err := askAIWithContext(question, contexts, proficiencyLevel, weakTopics, recentMistakes)
+	var chatHistory []ChatHistoryMessage
+	if role == "student" {
+		var pastInteractions []StudentInteraction
+		DB.Where("student_id = ? AND course_id = ? AND interaction_type = ?", userID, courseID, "doubt").
+			Order("id DESC").Limit(5).Find(&pastInteractions)
+		for i := len(pastInteractions) - 1; i >= 0; i-- {
+			chatHistory = append(chatHistory, ChatHistoryMessage{Role: "user", Content: pastInteractions[i].Question})
+			chatHistory = append(chatHistory, ChatHistoryMessage{Role: "assistant", Content: pastInteractions[i].Response})
+		}
+	}
+
+	answer, err := askAIWithContext(question, contexts, proficiencyLevel, weakTopics, recentMistakes, chatHistory)
 	if err != nil {
 		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
 		return
@@ -414,13 +421,14 @@ func GetCourseMaterialFileHandler(c *gin.Context) {
 	c.File(material.FilePath)
 }
 
-func askAIWithContext(question string, contexts []string, proficiencyLevel string, weakTopics []string, recentMistakes []string) (RAGAnswerResponse, error) {
+func askAIWithContext(question string, contexts []string, proficiencyLevel string, weakTopics []string, recentMistakes []string, chatHistory []ChatHistoryMessage) (RAGAnswerResponse, error) {
 	payload := RAGAnswerRequest{
 		Question:         question,
 		Contexts:         contexts,
 		ProficiencyLevel: proficiencyLevel,
 		WeakTopics:       weakTopics,
 		RecentMistakes:   recentMistakes,
+		ChatHistory:      chatHistory,
 	}
 	requestBytes, err := json.Marshal(payload)
 	if err != nil {
@@ -566,7 +574,7 @@ func GetStudentProfileHandler(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to calculate trend"})
 		return
 	}
-	progress, label, totalAssignments, err := courseProgressForStudent(userID, courseID, profile.TotalSubmissions)
+	progress, label, totalAssignments, _, _, err := courseProgressForStudent(userID, courseID, profile.TotalSubmissions)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to calculate course progress"})
 		return

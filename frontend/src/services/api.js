@@ -1,4 +1,5 @@
 import axios from 'axios'
+import { clearAuthSession, isTokenValid } from '../utils/auth'
 
 const api = axios.create({
   baseURL: 'http://localhost:5000',
@@ -6,8 +7,10 @@ const api = axios.create({
 
 api.interceptors.request.use((config) => {
   const token = localStorage.getItem('token')
-  if (token) {
+  if (token && isTokenValid(token)) {
     config.headers.Authorization = `Bearer ${token}`
+  } else if (token) {
+    clearAuthSession()
   }
   const isFormData =
     typeof FormData !== 'undefined' && config.data instanceof FormData
@@ -18,5 +21,19 @@ api.interceptors.request.use((config) => {
   }
   return config
 })
+
+api.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    const status = error?.response?.status
+    if (status === 401) {
+      clearAuthSession()
+      if (window.location.pathname !== '/login') {
+        window.location.assign('/login')
+      }
+    }
+    return Promise.reject(error)
+  },
+)
 
 export default api

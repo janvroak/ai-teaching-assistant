@@ -1,0 +1,46 @@
+[GIN-debug] [WARNING] Creating an Engine instance with the Logger and Recovery middleware already attached.
+
+[GIN-debug] [WARNING] Running in "debug" mode. Switch to "release" mode in production.
+ - using env:	export GIN_MODE=release
+ - using code:	gin.SetMode(gin.ReleaseMode)
+
+[GIN-debug] POST   /signup                   --> main.SignupHandler (4 handlers)
+[GIN-debug] POST   /login                    --> main.LoginHandler (4 handlers)
+[GIN-debug] POST   /auth/social              --> main.SocialAuthHandler (4 handlers)
+[GIN-debug] POST   /courses                  --> main.CreateCourseHandler (5 handlers)
+[GIN-debug] DELETE /courses/:id              --> main.DeleteCourseHandler (5 handlers)
+[GIN-debug] POST   /courses/join             --> main.JoinCourseHandler (5 handlers)
+[GIN-debug] GET    /courses                  --> main.ListCoursesHandler (5 handlers)
+[GIN-debug] POST   /courses/:id/materials    --> main.CreateCourseMaterialHandler (5 handlers)
+[GIN-debug] GET    /courses/:id/materials    --> main.ListCourseMaterialsHandler (5 handlers)
+[GIN-debug] POST   /courses/:id/units        --> main.CreateCourseUnitHandler (5 handlers)
+[GIN-debug] GET    /courses/:id/units        --> main.ListCourseUnitsHandler (5 handlers)
+[GIN-debug] POST   /courses/:id/doubt        --> main.AskCourseDoubtHandler (5 handlers)
+[GIN-debug] GET    /courses/:id/leaderboard  --> main.GetCourseLeaderboardHandler (5 handlers)
+[GIN-debug] GET    /courses/:id/student-profile --> main.GetStudentProfileHandler (5 handlers)
+[GIN-debug] GET    /courses/:id/analytics    --> main.GetCourseAnalyticsHandler (5 handlers)
+[GIN-debug] GET    /courses/:id/student-rank --> main.GetStudentRankHandler (5 handlers)
+[GIN-debug] GET    /courses/:id/chat-history --> main.GetCourseChatHistoryHandler (5 handlers)
+[GIN-debug] GET    /materials/:id/file       --> main.GetCourseMaterialFileHandler (5 handlers)
+[GIN-debug] GET    /courses/:id/assignments  --> main.ListCourseAssignmentsHandler (5 handlers)
+[GIN-debug] GET    /assignments/:id/submissions --> main.GetSubmissionsHandler (5 handlers)
+[GIN-debug] GET    /assignments/:id/plagiarism-flags --> main.ListAssignmentPlagiarismFlagsHandler (5 handlers)
+[GIN-debug] GET    /assignments/:id/question-file --> main.GetAssignmentQuestionPDFHandler (5 handlers)
+[GIN-debug] GET    /assignments/:id/answer-key-file --> main.GetAssignmentAnswerKeyPDFHandler (5 handlers)
+[GIN-debug] POST   /assignments              --> main.CreateAssignmentHandler (5 handlers)
+[GIN-debug] DELETE /assignments/:id          --> main.DeleteAssignmentHandler (5 handlers)
+[GIN-debug] POST   /submit                   --> main.SubmitHandler (5 handlers)
+[GIN-debug] POST   /submit-file              --> main.SubmitFileHandler (5 handlers)
+[GIN-debug] GET    /my-submissions           --> main.GetMySubmissionsHandler (5 handlers)
+[GIN-debug] GET    /submissions/:id          --> main.GetSubmissionHandler (5 handlers)
+[GIN-debug] GET    /submissions/:id/file     --> main.GetSubmissionFileHandler (5 handlers)
+[GIN-debug] PUT    /evaluations/:id          --> main.UpdateEvaluationHandler (5 handlers)
+[GIN-debug] PUT    /evaluations/:id/finalize --> main.FinalizeEvaluationHandler (5 handlers)
+[GIN-debug] GET    /evaluations/:id/audit    --> main.ListEvaluationAuditLogsHandler (5 handlers)
+[GIN-debug] GET    /profile                  --> main.main.func2 (5 handlers)
+[GIN-debug] GET    /protected/me             --> main.main.func3 (5 handlers)
+[GIN-debug] GET    /                         --> main.main.func4 (4 handlers)
+[GIN-debug] POST   /evaluate                 --> main.main.func5 (4 handlers)
+[GIN-debug] [WARNING] You trusted all proxies, this is NOT safe. We recommend you to set a value.
+Please check https://github.com/gin-gonic/gin/blob/master/docs/doc.md#dont-trust-all-proxies for details.
+[GIN-debug] Listening and serving HTTP on :5000

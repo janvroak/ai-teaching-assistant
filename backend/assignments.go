@@ -20,11 +20,20 @@ import (
 	"gorm.io/gorm"
 )
 
+type RubricCriterion struct {
+	Criterion   string  `json:"criterion"`
+	Description string  `json:"description"`
+	MaxMarks    float64 `json:"max_marks"`
+	Weight      float64 `json:"weight"`
+}
+
 type CreateAssignmentRequest struct {
 	CourseID  uint   `json:"course_id"`
+	UnitID    *uint  `json:"unit_id"`
 	Title     string `json:"title"`
 	Question  string `json:"question"`
 	AnswerKey string `json:"answer_key"`
+	Rubric    []RubricCriterion `json:"rubric"`
 }
 
 type ExtractPDFTextResponse struct {
@@ -33,12 +42,15 @@ type ExtractPDFTextResponse struct {
 
 type AssignmentListItem struct {
 	ID              uint   `json:"id"`
+	UnitID          *uint  `json:"unit_id,omitempty"`
 	Title           string `json:"title"`
 	Question        string `json:"question"`
 	QuestionType    string `json:"question_type"`
 	QuestionPDFURL  string `json:"question_pdf_url,omitempty"`
 	AnswerKeyType   string `json:"answer_key_type,omitempty"`
 	AnswerKeyPDFURL string `json:"answer_key_pdf_url,omitempty"`
+	HasRubric       bool   `json:"has_rubric"`
+	Rubric          []RubricCriterion `json:"rubric,omitempty"`
 }
 
 func CreateAssignmentHandler(c *gin.Context) {
@@ -77,6 +89,7 @@ func CreateAssignmentHandler(c *gin.Context) {
 	var req CreateAssignmentRequest
 	questionFilePath := ""
 	answerKeyFilePath := ""
+	rubricJSONInput := ""
 	contentType := strings.ToLower(strings.TrimSpace(c.ContentType()))
 
 	if strings.HasPrefix(contentType, "multipart/form-data") {
@@ -89,7 +102,20 @@ func CreateAssignmentHandler(c *gin.Context) {
 			return
 		}
 		req.CourseID = uint(parsedCourseID)
+		unitIDText := strings.TrimSpace(c.PostForm("unit_id"))
+		if unitIDText != "" {
+			parsedUnitID, parseErr := strconv.ParseUint(unitIDText, 10, 64)
+			if parseErr != nil || parsedUnitID == 0 {
+				c.JSON(http.StatusBadRequest, gin.H{
+					"error": "unit_id must be a positive integer",
+				})
+				return
+			}
+			parsedValue := uint(parsedUnitID)
+			req.UnitID = &parsedValue
+		}
 		req.Title = strings.TrimSpace(c.PostForm("title"))
+		rubricJSONInput = strings.TrimSpace(c.PostForm("rubric_json"))
 		questionText := strings.TrimSpace(c.PostForm("question_text"))
 		answerKeyText := strings.TrimSpace(c.PostForm("answer_key_text"))
 		legacyAnswerKey := strings.TrimSpace(c.PostForm("answer_key"))
@@ -183,6 +209,16 @@ func CreateAssignmentHandler(c *gin.Context) {
 			return
 		}
 		req.Question = strings.TrimSpace(req.Question)
+		if len(req.Rubric) > 0 {
+			encoded, err := json.Marshal(req.Rubric)
+			if err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{
+					"error": "rubric must be valid JSON",
+				})
+				return
+			}
+			rubricJSONInput = string(encoded)
+		}
 	}
 
 	req.Title = strings.TrimSpace(req.Title)
@@ -190,6 +226,18 @@ func CreateAssignmentHandler(c *gin.Context) {
 	if req.CourseID == 0 || req.Title == "" || req.Question == "" || req.AnswerKey == "" {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error": "course_id, title, answer_key, and one question input are required",
+		})
+		return
+	}
+	if err := ensureAssignmentUnitBelongsToCourse(DB, req.CourseID, req.UnitID); err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": "unit_id must belong to this course",
+			})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Failed to verify unit",
 		})
 		return
 	}
@@ -209,13 +257,22 @@ func CreateAssignmentHandler(c *gin.Context) {
 		})
 		return
 	}
+	rubricRows, normalizedRubricJSON, err := parseAndNormalizeRubric(rubricJSONInput)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": err.Error(),
+		})
+		return
+	}
 
 	assignment := Assignment{
 		CourseID:          req.CourseID,
+		UnitID:            req.UnitID,
 		Title:             req.Title,
 		Question:          req.Question,
 		QuestionFilePath:  questionFilePath,
 		AnswerKey:         req.AnswerKey,
+		RubricJSON:        normalizedRubricJSON,
 		AnswerKeyFilePath: answerKeyFilePath,
 	}
 
@@ -231,10 +288,44 @@ func CreateAssignmentHandler(c *gin.Context) {
 		"title":            assignment.Title,
 		"question":         assignment.Question,
 		"course_id":        assignment.CourseID,
+		"unit_id":          assignment.UnitID,
 		"question_type":    questionTypeForAssignment(assignment),
 		"question_pdf_url": questionPDFURLForAssignment(assignment),
 		"answer_key_type":  answerKeyTypeForAssignment(assignment),
+		"has_rubric":       len(rubricRows) > 0,
+		"rubric":           rubricRows,
 	})
+}
+
+func parseAndNormalizeRubric(raw string) ([]RubricCriterion, string, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return []RubricCriterion{}, "[]", nil
+	}
+	var rows []RubricCriterion
+	if err := json.Unmarshal([]byte(trimmed), &rows); err != nil {
+		return nil, "", errors.New("rubric_json must be a JSON array")
+	}
+	normalized := make([]RubricCriterion, 0, len(rows))
+	for _, row := range rows {
+		row.Criterion = strings.TrimSpace(row.Criterion)
+		row.Description = strings.TrimSpace(row.Description)
+		if row.Criterion == "" {
+			return nil, "", errors.New("each rubric criterion must include criterion")
+		}
+		if row.MaxMarks <= 0 {
+			return nil, "", errors.New("each rubric criterion must include max_marks > 0")
+		}
+		if row.Weight <= 0 {
+			row.Weight = row.MaxMarks
+		}
+		normalized = append(normalized, row)
+	}
+	encoded, err := json.Marshal(normalized)
+	if err != nil {
+		return nil, "", errors.New("failed to encode rubric")
+	}
+	return normalized, string(encoded), nil
 }
 
 func extractTextFromPDF(fileHeader *multipart.FileHeader) (string, error) {
@@ -581,8 +672,10 @@ func ListCourseAssignmentsHandler(c *gin.Context) {
 	for _, assignment := range assignments {
 		item := AssignmentListItem{
 			ID:           assignment.ID,
+			UnitID:       assignment.UnitID,
 			Title:        assignment.Title,
 			QuestionType: questionTypeForAssignment(assignment),
+			HasRubric:    strings.TrimSpace(assignment.RubricJSON) != "" && strings.TrimSpace(assignment.RubricJSON) != "[]",
 		}
 		if assignment.QuestionFilePath != "" {
 			item.QuestionPDFURL = questionPDFURLForAssignment(assignment)
@@ -595,10 +688,178 @@ func ListCourseAssignmentsHandler(c *gin.Context) {
 			if assignment.AnswerKeyFilePath != "" {
 				item.AnswerKeyPDFURL = answerKeyPDFURLForAssignment(assignment)
 			}
+			if item.HasRubric {
+				var rubric []RubricCriterion
+				if err := json.Unmarshal([]byte(assignment.RubricJSON), &rubric); err == nil {
+					item.Rubric = rubric
+				}
+			}
 		}
 
 		response = append(response, item)
 	}
 
 	c.JSON(http.StatusOK, response)
+}
+
+func DeleteAssignmentHandler(c *gin.Context) {
+	if DB == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Database is not initialized",
+		})
+		return
+	}
+
+	roleValue, ok := c.Get("role")
+	role, roleOK := roleValue.(string)
+	if !ok || !roleOK || strings.ToLower(strings.TrimSpace(role)) != "professor" {
+		c.JSON(http.StatusForbidden, gin.H{
+			"error": "Only professors can delete assignments",
+		})
+		return
+	}
+
+	userIDValue, ok := c.Get("user_id")
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"error": "Invalid token context",
+		})
+		return
+	}
+	professorID, ok := userIDValue.(uint)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"error": "Invalid user ID in token context",
+		})
+		return
+	}
+
+	assignmentIDParam := c.Param("id")
+	parsedAssignmentID, err := strconv.ParseUint(assignmentIDParam, 10, 64)
+	if err != nil || parsedAssignmentID == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "Invalid assignment id",
+		})
+		return
+	}
+	assignmentID := uint(parsedAssignmentID)
+
+	var assignment Assignment
+	if err := DB.Where("id = ?", assignmentID).First(&assignment).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{
+				"error": "Assignment not found",
+			})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Failed to fetch assignment",
+		})
+		return
+	}
+
+	var course Course
+	if err := DB.Where("id = ? AND professor_id = ?", assignment.CourseID, professorID).First(&course).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusForbidden, gin.H{
+				"error": "You can only delete assignments in your own courses",
+			})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Failed to verify assignment ownership",
+		})
+		return
+	}
+
+	filePaths := make([]string, 0, 16)
+	if path := strings.TrimSpace(assignment.QuestionFilePath); path != "" {
+		filePaths = append(filePaths, path)
+	}
+	if path := strings.TrimSpace(assignment.AnswerKeyFilePath); path != "" {
+		filePaths = append(filePaths, path)
+	}
+
+	tx := DB.Begin()
+	if tx.Error != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Failed to start delete transaction",
+		})
+		return
+	}
+
+	rollbackWithError := func(message string) {
+		tx.Rollback()
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": message,
+		})
+	}
+
+	var submissions []Submission
+	if err := tx.Where("assignment_id = ?", assignmentID).Find(&submissions).Error; err != nil {
+		rollbackWithError("Failed to fetch submissions")
+		return
+	}
+
+	submissionIDs := make([]uint, 0, len(submissions))
+	for _, submission := range submissions {
+		submissionIDs = append(submissionIDs, submission.ID)
+		if path := strings.TrimSpace(submission.FilePath); path != "" {
+			filePaths = append(filePaths, path)
+		}
+	}
+
+	if len(submissionIDs) > 0 {
+		var evaluationIDs []uint
+		if err := tx.Model(&Evaluation{}).Where("submission_id IN ?", submissionIDs).Pluck("id", &evaluationIDs).Error; err != nil {
+			rollbackWithError("Failed to fetch evaluation ids")
+			return
+		}
+
+		if len(evaluationIDs) > 0 {
+			if err := tx.Where("evaluation_id IN ?", evaluationIDs).Delete(&EvaluationQuestion{}).Error; err != nil {
+				rollbackWithError("Failed to delete evaluation questions")
+				return
+			}
+			if err := tx.Where("evaluation_id IN ?", evaluationIDs).Delete(&EvaluationAuditLog{}).Error; err != nil {
+				rollbackWithError("Failed to delete evaluation audit logs")
+				return
+			}
+		}
+
+		if err := tx.Where("submission_id IN ?", submissionIDs).Delete(&Evaluation{}).Error; err != nil {
+			rollbackWithError("Failed to delete evaluations")
+			return
+		}
+	}
+
+	if err := tx.Where("assignment_id = ?", assignmentID).Delete(&PlagiarismReport{}).Error; err != nil {
+		rollbackWithError("Failed to delete plagiarism reports")
+		return
+	}
+
+	if err := tx.Where("assignment_id = ?", assignmentID).Delete(&Submission{}).Error; err != nil {
+		rollbackWithError("Failed to delete submissions")
+		return
+	}
+
+	if err := tx.Where("id = ?", assignmentID).Delete(&Assignment{}).Error; err != nil {
+		rollbackWithError("Failed to delete assignment")
+		return
+	}
+
+	if err := tx.Commit().Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Failed to finalize assignment deletion",
+		})
+		return
+	}
+
+	for _, path := range filePaths {
+		_ = os.Remove(path)
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "Assignment deleted successfully",
+	})
 }
